@@ -3,44 +3,9 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>OPN Deck — YM2203 VGM Player</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Zen+Kaku+Gothic+New:wght@400;500;700;900&display=swap" rel="stylesheet">
+<title>OPN</title>
 <style>
-  /* ==========================================================================
-   OPN DECK — design tokens
-   Palette:
-     --bg-deep    #14110f  (chassis background, near-black warm brown)
-     --bg-panel   #1d1915  (panel face)
-     --bg-well    #100d0b  (recessed / input wells)
-     --line       #3a332a  (hairline borders, brushed metal seams)
-     --ink        #e8dfd0  (primary text, warm off-white)
-     --ink-dim    #8c8375  (secondary text)
-     --amber      #ff9d2e  (primary LED accent — VFD amber)
-     --amber-dim  #7a5220
-     --teal       #4fd8c4  (secondary LED accent — scope trace)
-     --red-led    #ff5252  (peak / rec indicator)
-   Type: display = "Zen Kaku Gothic New" (geometric, technical JP+Latin),
-         mono = "JetBrains Mono" (readouts, numeric data)
-   ========================================================================== */
 
-:root {
-  --bg-deep: #14110f;
-  --bg-panel: #1d1915;
-  --bg-panel-2: #211c17;
-  --bg-well: #0d0b09;
-  --line: #3a332a;
-  --line-soft: #2a251f;
-  --ink: #e8dfd0;
-  --ink-dim: #8c8375;
-  --ink-faint: #5c554a;
-  --amber: #ff9d2e;
-  --amber-soft: #ffb85e;
-  --amber-dim: #6b4a24;
-  --teal: #4fd8c4;
-  --red-led: #ff5252;
-  --radius: 3px;
-}
 
 * { box-sizing: border-box; }
 
@@ -491,15 +456,11 @@ button, input {
         </svg>
       </div>
       <div class="brand-text">
-        <h1>OPN DECK</h1>
-        <p>YM2203 SOFTWARE SYNTHESIZER — VGM PLAYBACK UNIT</p>
+        <h1>OPN-WEB</h1>
+        
       </div>
     </div>
-    <div class="chip-badge">
-      <span class="chip-badge-label">CHIP</span>
-      <span class="chip-badge-value">YM2203 / OPN</span>
-      <span class="chip-badge-sub">4×FM + 3×SSG</span>
-    </div>
+  
   </header>
 
   <main class="deck-body">
@@ -581,10 +542,6 @@ button, input {
     </section>
 
   </main>
-
-  <footer class="deck-footer">
-    <p>全処理はブラウザ内で完結します。ファイルはサーバーへ送信されません。VGM仕様: YM2203コマンド(0x55)のみエミュレートし、他チップの書き込みは無視されます。</p>
-  </footer>
 
 </div>
 
