@@ -107,9 +107,9 @@ async function loadFile(file) {
     await ensureAudio();
     await sendLoadToWorklet(parser);
     await togglePlay();
-    els.rack.hidden = false;
+   
     state.loaded = true;
-    updateSeekRange();
+   
    
   } catch (err) {
     console.error(err);
