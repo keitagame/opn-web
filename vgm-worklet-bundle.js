@@ -288,11 +288,13 @@ class FMOperator {
   }
 
   // Compute effective rate with key scaling
-  effRate(rate) {
+  effRate(rate, isRelease = false) {
     if (rate === 0) return 0;
     const ks = this.ks; // 0..3
     const rks = this.blockFnum >> (3 - ks);
-    let r = rate * 2 + rks;
+    
+    // リリースの場合は (RR * 2 + 1 + RKS)、それ以外は (Rate * 2 + RKS)
+    let r = isRelease ? (rate * 2 + 1 + rks) : (rate * 2 + rks);
     if (r > 63) r = 63;
     if (r < 0) r = 0;
     return r;
@@ -337,9 +339,12 @@ case 'sustain': {
   }
   break;
 }
-      case 'release': {
-        const r = this.effRate(this.rr * 2 + 1);
-        const step = rateToStep(r) * 40;
+     case 'release': {
+        // 修正: 第2引数に true を渡し、引数には this.rr を直接渡す（重複乗算を防止）
+        const r = this.effRate(this.rr, true);
+        
+        // 修正: 40倍されていた倍率（* 40）を削除し、適切な減衰スピードにする
+        const step = rateToStep(r);
         this.envLevel += step;
         break;
       }
@@ -348,6 +353,7 @@ case 'sustain': {
     }
     if (this.envLevel > 1023) this.envLevel = 1023;
     if (this.envLevel < 0) this.envLevel = 0;
+     
   }
 
   // Get current output given modulation input (phase modulation, in radians*scale)
