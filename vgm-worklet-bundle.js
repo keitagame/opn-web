@@ -739,7 +739,7 @@ class YM2203 {
       const chSel = addr & 0x03;
       if (chSel > 2) return;
       const opSel = (addr >> 2) & 0x03; // 0..3 operator index within group
-      const regGroup = addr & 0xfc;
+      const regGroup = addr & 0xf0;
       const channel = this.channels[chSel];
       const op = channel.ops[OP_ORDER[opSel]];
 
