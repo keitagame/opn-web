@@ -261,10 +261,7 @@ function updateSeekRange() {
 }
 
 function updateSeekUI() {
-  if (!state.seeking) {
-    els.seekBar.value = state.currentPositionSample;
-  }
-  els.timeCurrent.textContent = samplesToTime(state.currentPositionSample);
+  
 }
 
 function samplesToTime(samples) {
