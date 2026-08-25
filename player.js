@@ -155,7 +155,7 @@ async function ensureAudio() {
   });
 
   const gain = ctx.createGain();
-  gain.gain.value = (parseInt(els.volBar.value, 10) / 100) ** 1.6;
+  gain.gain.value = 1.0;
 
   const analyser = ctx.createAnalyser();
   analyser.fftSize = 1024;
