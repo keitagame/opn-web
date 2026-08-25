@@ -686,33 +686,26 @@ class YM2203 {
 
   // VGM YM2203 write: port (0 or 1 unused for 2203, it's single address space
   // but many VGM streams use command 0x55 aa dd) -> we implement write(addr, data)
-  write(addr, data) {
+  write(port, addr, data) {
     addr &= 0xff;
     data &= 0xff;
-
-   if (addr === 0x28) {
-  const ch = data & 0x03;
-  if (ch > 2) return;
-  const opMask = (data >> 4) & 0x0f;
-  const channel = this.channels[ch];
-  
-  // マスクされたオペレータのみをON/OFF制御する
-  for (let i = 0; i < 4; i++) {
-    if (opMask & (1 << i)) {
-      channel.ops[i].setKeyOn(true);
-    } else {
-      channel.ops[i].setKeyOn(false);
-    }
-  }
-  return;
-}
-
-    if (addr < 0x10) {
-      // SSG registers 0x00-0x0F map directly
-      this.ssg.writeReg(addr, data);
+if (port === 0 && addr === 0x28) {
+      const chBits = data & 0x07;
+      if ((chBits & 0x03) === 3) return;
+      const ch = (chBits & 0x04 ? 3 : 0) + (chBits & 0x03);
+      const opMask = (data >> 4) & 0x0f;
+      const channel = this.channels[ch];
+      for (let i = 0; i < 4; i++) {
+        channel.ops[i].setKeyOn((opMask & (1 << i)) !== 0);
+      }
       return;
     }
 
+    // SSG レジスタ (Port 0 の 0x00~0x0F)
+    if (port === 0 && addr < 0x10) {
+      this.ssg.writeReg(addr, data);
+      return;
+    }
     if (addr === 0x2d || addr === 0x2e || addr === 0x2f) {
       // prescaler select, ignore (rare in VGMs)
       return;
@@ -720,45 +713,49 @@ class YM2203 {
 
     // FM operator registers 0x30-0x9F, channel encoded in low 2 bits (0,1,2; 3=unused for 2203)
     if (addr >= 0x30 && addr < 0xa0) {
-      const chSel = addr & 0x03;
-      if (chSel > 2) return;
-      const opSel = (addr >> 2) & 0x03; // 0..3 operator index within group
+      const opSelGroup = addr & 0x03;
+      if (opSelGroup > 2) return;
+      const chSel = opSelGroup + (port * 3); // Port 1 なら +3 (Ch3~5)
+      const opSel = (addr >> 2) & 0x03;
       const regGroup = addr & 0xf0;
       const channel = this.channels[chSel];
       const op = channel.ops[OP_ORDER[opSel]];
 
       switch (regGroup) {
-        case 0x30: // DT/MUL
-          op.mul = data & 0x0f;
-          op.det = (data >> 4) & 0x07;
-          this._updateFreq(channel);
-          break;
-        case 0x40: // TL
-          op.tl = data & 0x7f;
-          break;
-        case 0x50: // KS/AR
-          op.ks = (data >> 6) & 0x03;
-          op.ar = data & 0x1f;
-          break;
-        case 0x60: // AM/DR (decay rate) - AM not implemented (LFO), decay only
-          op.dr = data & 0x1f;
-          break;
-        case 0x70: // SR (sustain rate)
-          op.sr = data & 0x1f;
-          break;
-        case 0x80: // SL/RR
-          op.sl = (data >> 4) & 0x0f;
-          op.rr = data & 0x0f;
-          break;
-        case 0x90: // SSG-EG
-          op.ssgeg = data & 0x0f;
-          break;
-        default:
-          break;
+        case 0x30: op.mul = data & 0x0f; op.det = (data >> 4) & 0x07; this._updateFreq(channel); break;
+        case 0x40: op.tl = data & 0x7f; break;
+        case 0x50: op.ks = (data >> 6) & 0x03; op.ar = data & 0x1f; break;
+        case 0x60: op.dr = data & 0x1f; break;
+        case 0x70: op.sr = data & 0x1f; break;
+        case 0x80: op.sl = (data >> 4) & 0x0f; op.rr = data & 0x0f; break;
+        case 0x90: op.ssgeg = data & 0x0f; break;
       }
       return;
     }
-
+const chBase = port * 3;
+    switch (addr) {
+      case 0xa0: case 0xa1: case 0xa2: {
+        const ch = (addr - 0xa0) + chBase;
+        this._pendingFnumLo = this._pendingFnumLo || {};
+        this._pendingFnumLo[ch] = data;
+        this._applyFreq(ch);
+        break;
+      }
+      case 0xa4: case 0xa5: case 0xa6: {
+        const ch = (addr - 0xa4) + chBase;
+        this._pendingFnumHi = this._pendingFnumHi || {};
+        this._pendingFnumHi[ch] = data;
+        this._applyFreq(ch);
+        break;
+      }
+      case 0xb0: case 0xb1: case 0xb2: {
+        const ch = (addr - 0xb0) + chBase;
+        const channel = this.channels[ch];
+        channel.algorithm = data & 0x07;
+        channel.feedback = (data >> 3) & 0x07;
+        break;
+      }
+    }
     switch (addr) {
       case 0x22: // LFO (not implemented, ignore)
         break;
@@ -791,71 +788,7 @@ class YM2203 {
       default:
         break;
     }
-    if (port === 0 && addr === 0x28) {
-      const chBits = data & 0x07;
-      if ((chBits & 0x03) === 3) return; // チャンネル指定無効値
-      const ch = (chBits & 0x04 ? 3 : 0) + (chBits & 0x03);
-      const opMask = (data >> 4) & 0x0f;
-      const channel = this.channels[ch];
-      for (let i = 0; i < 4; i++) {
-        channel.ops[i].setKeyOn((opMask & (1 << i)) !== 0);
-      }
-      return;
-    }
 
-    // SSGレジスタ (Port 0 の 0x00~0x0F)
-    if (port === 0 && addr < 0x10) {
-      this.ssg.writeReg(addr, data);
-      return;
-    }
-
-    // FM オペレータレジスタ (0x30~0x9F)
-    if (addr >= 0x30 && addr < 0xa0) {
-      const opSelGroup = addr & 0x03;
-      if (opSelGroup > 2) return;
-      const chSel = opSelGroup + (port * 3); // Port 1 なら +3
-      const opSel = (addr >> 2) & 0x03;
-      const regGroup = addr & 0xf0;
-      const channel = this.channels[chSel];
-      const op = channel.ops[OP_ORDER[opSel]];
-
-      switch (regGroup) {
-        case 0x30: op.mul = data & 0x0f; op.det = (data >> 4) & 0x07; this._updateFreq(channel); break;
-        case 0x40: op.tl = data & 0x7f; break;
-        case 0x50: op.ks = (data >> 6) & 0x03; op.ar = data & 0x1f; break;
-        case 0x60: op.dr = data & 0x1f; break;
-        case 0x70: op.sr = data & 0x1f; break;
-        case 0x80: op.sl = (data >> 4) & 0x0f; op.rr = data & 0x0f; break;
-        case 0x90: op.ssgeg = data & 0x0f; break;
-      }
-      return;
-    }
-
-    // 周波数・アルゴリズムレジスタ (0xA0~0xB2)
-    const chBase = port * 3;
-    switch (addr) {
-      case 0xa0: case 0xa1: case 0xa2: {
-        const ch = (addr - 0xa0) + chBase;
-        this._pendingFnumLo = this._pendingFnumLo || {};
-        this._pendingFnumLo[ch] = data;
-        this._applyFreq(ch);
-        break;
-      }
-      case 0xa4: case 0xa5: case 0xa6: {
-        const ch = (addr - 0xa4) + chBase;
-        this._pendingFnumHi = this._pendingFnumHi || {};
-        this._pendingFnumHi[ch] = data;
-        this._applyFreq(ch);
-        break;
-      }
-      case 0xb0: case 0xb1: case 0xb2: {
-        const ch = (addr - 0xb0) + chBase;
-        const channel = this.channels[ch];
-        channel.algorithm = data & 0x07;
-        channel.feedback = (data >> 3) & 0x07;
-        break;
-      }
-    }
   }
 
   _applyFreq(ch) {
@@ -962,7 +895,7 @@ class VGMPlayerProcessor extends AudioWorkletProcessor {
     let i = 0;
     while (i < this.events.length && this.events[i].sampleOffset <= targetSample) {
       const ev = this.events[i];
-      if (ev.type === 'ym2203'){ this.chip.write(ev.addr, ev.data) 
+      if (ev.type === 'ym2203'){ this.chip.write(0, ev.addr, ev.data);
 
       } else if (ev.type === 'ym2608') {
   this.chip.write(ev.port, ev.addr, ev.data);
