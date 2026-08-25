@@ -677,7 +677,60 @@ class SSG {
     return mono;
   }
 }
+class OPNARhythm {
+  constructor(sampleRate) {
+    this.sampleRate = sampleRate;
+    this.totalVol = 63;
+    this.vols = new Uint8Array(6).fill(31);
+    this.env = new Float32Array(6).fill(0);
+    this.freqs = [150, 180, 800, 3000, 200, 800];
+    this.phases = new Float32Array(6).fill(0);
+    this.noiseShift = 0x1234;
+  }
 
+  writeReg(addr, data) {
+    if (addr === 0x10) {
+      for (let ch = 0; ch < 6; ch++) {
+        if (data & (1 << ch)) {
+          this.env[ch] = 1.0;
+          this.phases[ch] = 0;
+        }
+      }
+    } else if (addr === 0x11) {
+      this.totalVol = data & 0x3f;
+    } else if (addr >= 0x18 && addr <= 0x1d) {
+      this.vols[addr - 0x18] = data & 0x1f;
+    }
+  }
+
+  render() {
+    let out = 0;
+    const totalGain = Math.pow(10, -(63 - this.totalVol) / 20);
+
+    for (let ch = 0; ch < 6; ch++) {
+      if (this.env[ch] <= 0.001) continue;
+
+      const gain = Math.pow(10, -(31 - this.vols[ch]) / 20) * this.env[ch];
+      this.noiseShift = (this.noiseShift >> 1) ^ ((this.noiseShift & 1) ? 0x12000 : 0);
+      const noise = ((this.noiseShift & 1) * 2 - 1);
+
+      let sample = 0;
+      this.phases[ch] += (this.freqs[ch] / this.sampleRate) * Math.PI * 2;
+
+      switch (ch) {
+        case 0: sample = Math.sin(this.phases[ch] * (1 + this.env[ch] * 2)); this.env[ch] *= 0.9985; break; // BD
+        case 1: sample = Math.sin(this.phases[ch]) * 0.4 + noise * 0.6; this.env[ch] *= 0.996; break;       // SD
+        case 2:                                                                                             // TOP
+        case 3: sample = noise; this.env[ch] *= (ch === 3 ? 0.992 : 0.997); break;                          // HH
+        case 4: sample = Math.sin(this.phases[ch] * (1 + this.env[ch])); this.env[ch] *= 0.997; break;      // TOM
+        case 5: sample = noise * 0.3 + Math.sin(this.phases[ch]) * 0.7; this.env[ch] *= 0.985; break;       // RIM
+      }
+
+      out += sample * gain;
+    }
+    return out * totalGain * 0.25;
+  }
+}
 
 class YM2608 {
   constructor(sampleRate, clock) {
