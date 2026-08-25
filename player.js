@@ -107,7 +107,7 @@ async function loadFile(file) {
     await ensureAudio();
     await sendLoadToWorklet(parser);
     await togglePlay();
-   
+    state.workletNode.port.postMessage({ type: 'play'});
     state.loaded = true;
    
    
