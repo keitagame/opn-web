@@ -1,36 +1,3 @@
-/*
- * AudioWorkletProcessor that drives the YM2203 emulator sample-by-sample,
- * consuming pre-parsed VGM events at the correct sample offsets.
- *
- * VGM files are authored at 44100 Hz sample timing regardless of actual
- * output sample rate, so we run an internal 44100 Hz clock and resample
- * to the AudioContext's sampleRate via simple linear interpolation if needed.
- */
-
-// classes YM2203 / VGMParser are inlined below since AudioWorklet modules
-// cannot easily `importScripts` in all browsers reliably from blob URLs;
-// the main thread injects the source via addModule with concatenated code.
-/*
- * YM2203 (OPN) Emulator in JavaScript
- * - 4 channel FM synthesis (4-operator, 8 algorithms)
- * - 3 channel SSG (AY-3-8910 compatible square wave + noise + envelope)
- *
- * This is a from-scratch, compact software implementation intended for
- * VGM playback. It follows the well-documented OPN register map and
- * standard FM synthesis math (phase accumulation, sine table, envelope
- * generator with attack/decay/sustain/release + SSG-EG style rates).
- */
-/*
- * VGM (Video Game Music) file parser
- * Spec reference: https://vgmrips.net/wiki/VGM_Specification
- *
- * Focuses on extracting:
- *  - Header info (clocks, loop point, track metadata via GD3)
- *  - The command stream as a flat array of parsed events with sample timing
- *
- * Supports the commands relevant to YM2203 playback plus generic wait/end
- * commands so unrelated chip writes are simply skipped (harmless).
- */
 
 'use strict';
 const SSG_VOL_TABLE = [
@@ -438,7 +405,7 @@ updateOperatorFreqs(sampleRate, clock) {
     const fbShift = this.feedback > 0 ? (10 - this.feedback) : 16;
     const fbMod = this.feedback > 0 ? ((op1.out + op1.out2) * SIN_LEN) / Math.pow(2, fbShift) : 0;
 
-    const MOD_SCALE = SIN_LEN * 2.5;
+    const MOD_SCALE = SIN_LEN * 2.0;
 
   let out1, out2, out3, out4, chOut;
 
@@ -498,7 +465,7 @@ updateOperatorFreqs(sampleRate, clock) {
       out2 = op2.getSample(0);
       out3 = op3.getSample(0);
       out4 = op4.getSample(0);
-      chOut = out1 + out2 + op3.out + op4.out;
+      chOut = out1 + out2 + out3 + out4; // op3.out, op4.out ではなく out3, out4 を使用
       break;
   }
 
@@ -661,18 +628,13 @@ class SSG {
       const useEnv = (volReg & 0x10) !== 0;
       let vol = useEnv ? this.envAtten : (volReg & 0x0f);
 
-      if (active) {
-        // convert 0..15 volume to amplitude (roughly logarithmic like real AY)
-        const amp = vol === 0 ? 0 : Math.pow(2, (vol - 15) / 2);
-        mono += amp;
-      }
-      for (let ch = 0; ch < 3; ch++) {
-    // ...
-    let vol = useEnv ? this.envAtten : (volReg & 0x0f);
+     
+     
+    
     if (active) {
       mono += SSG_VOL_TABLE[vol] * 0.2; // 実機準拠テーブルを使用
     }
-  }
+  
     }
     
     // Sum (not average) the three channels so a single active channel still
