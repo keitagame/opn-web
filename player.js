@@ -267,19 +267,6 @@ function updateSeekUI() {
   els.timeCurrent.textContent = samplesToTime(state.currentPositionSample);
 }
 
-els.seekBar.addEventListener('pointerdown', () => { state.seeking = true; });
-els.seekBar.addEventListener('input', () => {
-  els.timeCurrent.textContent = samplesToTime(parseInt(els.seekBar.value, 10));
-});
-els.seekBar.addEventListener('pointerup', () => {
-  const target = parseInt(els.seekBar.value, 10);
-  if (state.workletNode) {
-    state.workletNode.port.postMessage({ type: 'seekSample', sample: target });
-  }
-  state.currentPositionSample = target;
-  state.seeking = false;
-});
-
 function samplesToTime(samples) {
   const totalSec = samples / 44100;
   const m = Math.floor(totalSec / 60);
@@ -288,13 +275,6 @@ function samplesToTime(samples) {
 }
 
 // ---------- Volume ----------
-
-els.volBar.addEventListener('input', () => {
-  if (state.gainNode) {
-    const v = parseInt(els.volBar.value, 10) / 100;
-    state.gainNode.gain.setTargetAtTime(Math.pow(v, 1.6), state.audioCtx.currentTime, 0.01);
-  }
-});
 
 // ---------- Status ----------
 
