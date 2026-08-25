@@ -4,6 +4,20 @@ const SSG_VOL_TABLE = [
   0.0000, 0.0047, 0.0069, 0.0101, 0.0147, 0.0218, 0.0319, 0.0467,
   0.0684, 0.1004, 0.1472, 0.2159, 0.3168, 0.4650, 0.6815, 1.0000
 ];
+// 実機OPN仕様のデチューンテーブル (キーコード 0~31 × 強度 0~3)
+const DETUNE_TABLE = [
+  [0, 0, 1, 2], [0, 0, 1, 2], [0, 0, 1, 2], [0, 0, 1, 2],
+  [0, 0, 1, 2], [0, 1, 1, 2], [0, 1, 1, 2], [0, 1, 2, 3],
+  [0, 1, 2, 3], [0, 1, 2, 3], [0, 1, 2, 4], [0, 1, 3, 4],
+  [0, 1, 3, 4], [0, 1, 3, 5], [0, 2, 4, 5], [0, 2, 4, 6],
+  [0, 2, 4, 6], [0, 2, 5, 7], [0, 2, 5, 8], [0, 3, 6, 8],
+  [0, 3, 6, 9], [0, 3, 7, 10], [0, 4, 8, 11], [0, 4, 8, 12],
+  [0, 4, 9, 13], [0, 5, 10, 14], [0, 5, 11, 16], [0, 6, 12, 17],
+  [0, 6, 13, 19], [0, 7, 14, 20], [0, 8, 16, 22], [0, 9, 17, 24]
+];
+
+// F-Numberの上位4ビットからノート区分(0~3)を引く変換表
+const FNUM_TO_NOTE_CODE = [0, 0, 0, 0, 0, 0, 0, 1, 2, 3, 3, 3, 3, 3, 3, 3];
 class VGMParser {
   constructor(arrayBuffer) {
     this.buf = new Uint8Array(arrayBuffer);
@@ -379,16 +393,29 @@ class FMChannel {
   }
 // 修正後
 updateOperatorFreqs(sampleRate, clock) {
-  // clock を 6 で割らず、マスタークロックを直接使用します
-  const baseFreq = (this.fnum * clock) / (144 * Math.pow(2, 20 - this.block));
-  
-  for (const op of this.ops) {
-    const detuneHz = DETUNE_TABLE[op.det] ? DETUNE_TABLE[op.det][this.block] || 0 : 0;
-    const mul = op.mul === 0 ? 0.5 : op.mul;
-    const f = baseFreq * mul + detuneHz;
-    op.freq = (f / sampleRate) * SIN_LEN;
+    const baseFreq = (this.fnum * clock) / (144 * Math.pow(2, 20 - this.block));
+    
+    // F-NumberとBlockからキーコード (0..31) を算出
+    const fnumHi = (this.fnum >> 7) & 0x0f;
+    const noteCode = FNUM_TO_NOTE_CODE[fnumHi];
+    const keyCode = Math.min(31, (this.block << 2) | noteCode);
+
+    for (const op of this.ops) {
+      const mul = op.mul === 0 ? 0.5 : op.mul;
+      
+      // デチューン値の取得 (ビット2が符号、ビット0-1が強度)
+      const detMag = op.det & 0x03;
+      const isNegative = (op.det & 0x04) !== 0;
+      const detRaw = DETUNE_TABLE[keyCode][detMag];
+      const detSign = isNegative ? -detRaw : detRaw;
+
+      // オクターブ(Block)にスケールを合わせたデチューン周波数(Hz)
+      const detuneHz = (detSign * clock) / (144 * Math.pow(2, 20 - this.block));
+
+      const f = baseFreq * mul + detuneHz;
+      op.freq = (f / sampleRate) * SIN_LEN;
+    }
   }
-}
   keyOn(opMask) {
     for (let i = 0; i < 4; i++) {
       if (opMask & (1 << i)) this.ops[i].setKeyOn(true);
@@ -479,17 +506,6 @@ updateOperatorFreqs(sampleRate, clock) {
   }
 }
 
-// Rough detune table (Hz offsets), simplified from standard OPN detune table by block.
-const DETUNE_TABLE = {
-  0: [0, 0, 0, 0, 0, 0, 0, 0],
-  1: [0, 0, 1, 2, 2, 4, 5, 6],
-  2: [0, 1, 2, 2, 4, 5, 6, 8],
-  3: [0, 1, 2, 3, 4, 6, 8, 10],
-  4: [0, 0, 0, 0, 0, 0, 0, 0],
-  5: [0, -1, -2, -2, -4, -5, -6, -8],
-  6: [0, -1, -2, -3, -4, -6, -8, -10],
-  7: [0, -2, -3, -4, -6, -8, -10, -12],
-};
 
 // ---------- SSG (AY-3-8910 compatible, 3 square channels + noise + envelope) ----------
 
