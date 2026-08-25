@@ -155,7 +155,7 @@ async function ensureAudio() {
   });
 
   const gain = ctx.createGain();
-  gain.gain.value = 1.0;
+  gain.gain.value = 0.7;
 
   const analyser = ctx.createAnalyser();
   analyser.fftSize = 1024;
