@@ -182,8 +182,12 @@ class VGMParser {
         // YM2151 write
         p += 3;
       } else if (cmd === 0x56 || cmd === 0x57) {
-        // YM2413 / others
-        p += 3;
+  const port = (cmd === 0x57) ? 1 : 0;
+  const addr = buf[p + 1];
+  const data = buf[p + 2];
+  this.events.push({ sampleOffset, type: 'ym2608', port, addr, data });
+  p += 3;
+
       } else if (cmd === 0x5a || cmd === 0x5b || cmd === 0x5c || cmd === 0x5d || cmd === 0x5e || cmd === 0x5f) {
         p += 3;
       } else if (cmd === 0xa0) {
@@ -672,7 +676,8 @@ class YM2203 {
   constructor(sampleRate, clock) {
     this.sampleRate = sampleRate;
     this.clock = clock || 3993600; // common YM2203 clock (varies per system, e.g. 3.99MHz)
-    this.channels = [new FMChannel(), new FMChannel(), new FMChannel()];
+    //this.channels = [new FMChannel(), new FMChannel(), new FMChannel()];
+    this.channels = Array.from({ length: 6 }, () => new FMChannel());
     this.ssg = new SSG(sampleRate, this.clock / 2); // SSG typically runs at clock/2 in OPN
     this.selectedRegPart0 = 0;
     this.prescaler = 6; // OPN default prescaler divides clock for FM
@@ -786,6 +791,71 @@ class YM2203 {
       default:
         break;
     }
+    if (port === 0 && addr === 0x28) {
+      const chBits = data & 0x07;
+      if ((chBits & 0x03) === 3) return; // チャンネル指定無効値
+      const ch = (chBits & 0x04 ? 3 : 0) + (chBits & 0x03);
+      const opMask = (data >> 4) & 0x0f;
+      const channel = this.channels[ch];
+      for (let i = 0; i < 4; i++) {
+        channel.ops[i].setKeyOn((opMask & (1 << i)) !== 0);
+      }
+      return;
+    }
+
+    // SSGレジスタ (Port 0 の 0x00~0x0F)
+    if (port === 0 && addr < 0x10) {
+      this.ssg.writeReg(addr, data);
+      return;
+    }
+
+    // FM オペレータレジスタ (0x30~0x9F)
+    if (addr >= 0x30 && addr < 0xa0) {
+      const opSelGroup = addr & 0x03;
+      if (opSelGroup > 2) return;
+      const chSel = opSelGroup + (port * 3); // Port 1 なら +3
+      const opSel = (addr >> 2) & 0x03;
+      const regGroup = addr & 0xf0;
+      const channel = this.channels[chSel];
+      const op = channel.ops[OP_ORDER[opSel]];
+
+      switch (regGroup) {
+        case 0x30: op.mul = data & 0x0f; op.det = (data >> 4) & 0x07; this._updateFreq(channel); break;
+        case 0x40: op.tl = data & 0x7f; break;
+        case 0x50: op.ks = (data >> 6) & 0x03; op.ar = data & 0x1f; break;
+        case 0x60: op.dr = data & 0x1f; break;
+        case 0x70: op.sr = data & 0x1f; break;
+        case 0x80: op.sl = (data >> 4) & 0x0f; op.rr = data & 0x0f; break;
+        case 0x90: op.ssgeg = data & 0x0f; break;
+      }
+      return;
+    }
+
+    // 周波数・アルゴリズムレジスタ (0xA0~0xB2)
+    const chBase = port * 3;
+    switch (addr) {
+      case 0xa0: case 0xa1: case 0xa2: {
+        const ch = (addr - 0xa0) + chBase;
+        this._pendingFnumLo = this._pendingFnumLo || {};
+        this._pendingFnumLo[ch] = data;
+        this._applyFreq(ch);
+        break;
+      }
+      case 0xa4: case 0xa5: case 0xa6: {
+        const ch = (addr - 0xa4) + chBase;
+        this._pendingFnumHi = this._pendingFnumHi || {};
+        this._pendingFnumHi[ch] = data;
+        this._applyFreq(ch);
+        break;
+      }
+      case 0xb0: case 0xb1: case 0xb2: {
+        const ch = (addr - 0xb0) + chBase;
+        const channel = this.channels[ch];
+        channel.algorithm = data & 0x07;
+        channel.feedback = (data >> 3) & 0x07;
+        break;
+      }
+    }
   }
 
   _applyFreq(ch) {
@@ -858,7 +928,9 @@ class VGMPlayerProcessor extends AudioWorkletProcessor {
         this.loopSampleOffset = msg.loopSampleOffset;
         this.eventIndex = 0;
         this.currentSample = 0;
-        this.chip = new YM2203(this.vgmRate, msg.clock || 3993600);
+        const clock = msg.clock || msg.ym2608Clock || msg.ym2203Clock || 7987200;
+        this.chip = new YM2203(this.vgmRate, clock);
+        //this.chip = new YM2203(this.vgmRate, msg.clock || 3993600);
         this.ended = false;
         this.playing = false;
         this.port.postMessage({ type: 'loaded' });
@@ -890,7 +962,11 @@ class VGMPlayerProcessor extends AudioWorkletProcessor {
     let i = 0;
     while (i < this.events.length && this.events[i].sampleOffset <= targetSample) {
       const ev = this.events[i];
-      if (ev.type === 'ym2203') this.chip.write(ev.addr, ev.data);
+      if (ev.type === 'ym2203'){ this.chip.write(ev.addr, ev.data) 
+
+      } else if (ev.type === 'ym2608') {
+  this.chip.write(ev.port, ev.addr, ev.data);
+}
       i++;
     }
     this.eventIndex = i;
@@ -902,8 +978,10 @@ class VGMPlayerProcessor extends AudioWorkletProcessor {
     while (this.eventIndex < this.events.length && this.events[this.eventIndex].sampleOffset <= this.currentSample) {
       const ev = this.events[this.eventIndex];
       if (ev.type === 'ym2203') {
-        this.chip.write(ev.addr, ev.data);
-      } else if (ev.type === 'end') {
+  this.chip.write(0, ev.addr, ev.data);
+} else if (ev.type === 'ym2608') {
+  this.chip.write(ev.port, ev.addr, ev.data);
+}else if (ev.type === 'end') {
         if (this.loopEnabled && this.loopSampleOffset >= 0) {
           this.currentSample = this.loopSampleOffset;
           // find event index corresponding to loop point
