@@ -128,7 +128,7 @@ async function loadFile(file) {
     populateMeta(parser, file.name);
     await ensureAudio();
     await sendLoadToWorklet(parser);
-
+    await togglePlay();
     els.rack.hidden = false;
     state.loaded = true;
     updateSeekRange();
@@ -237,7 +237,7 @@ function handleWorkletMessage(msg) {
 }
 
 // ---------- Transport controls ----------
-togglePlay();
+
 
 async function togglePlay() {
   if (!state.loaded) return;
