@@ -442,7 +442,7 @@ updateOperatorFreqs(sampleRate, clock) {
     const fbShift = this.feedback > 0 ? (10 - this.feedback) : 16;
     const fbMod = this.feedback > 0 ? ((op1.out + op1.out2) * SIN_LEN) / Math.pow(2, fbShift) : 0;
 
-    const MOD_SCALE = SIN_LEN * 2.0;
+    const MOD_SCALE = SIN_LEN * 1.25;
 
   let out1, out2, out3, out4, chOut;
 
