@@ -34,8 +34,8 @@
 
 'use strict';
 const SSG_VOL_TABLE = [
-  0.0000, 0.0099, 0.0144, 0.0210, 0.0307, 0.0454, 0.0665, 0.0973,
-  0.1426, 0.2093, 0.3070, 0.4503, 0.6606, 0.9696, 1.4210, 2.0852
+  0.0000, 0.0047, 0.0069, 0.0101, 0.0147, 0.0218, 0.0319, 0.0467,
+  0.0684, 0.1004, 0.1472, 0.2159, 0.3168, 0.4650, 0.6815, 1.0000
 ];
 class VGMParser {
   constructor(arrayBuffer) {
@@ -624,7 +624,7 @@ class SSG {
 
   render() {
     // Advance tone generators (simple toggling square wave at clock/16/period)
-    const toneStepDivisor = 8; // AY divides clock by 16 for the tone counters' clock
+    const toneStepDivisor = 4; // AY divides clock by 16 for the tone counters' clock
     let left = 0, right = 0, mono = 0;
     const mixer = this.mixerByte();
 
@@ -836,7 +836,7 @@ class YM2203 {
 
     const ssgOut = this.ssg.render();
 
-    const mix = fmOut * 0.5 + ssgOut * 0.45;
+    const mix = fmOut * 0.5 + ssgOut * 0.5;
     // soft limiter: gentle tanh saturation keeps peaks in range without
     // audibly compressing normal-level passages
     return Math.tanh(mix * 1.15);
