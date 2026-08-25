@@ -610,28 +610,23 @@ class SSG {
     }
     this.envAtten = Math.max(0, Math.min(15, level));
   }
-
   render() {
-    // Advance tone generators (simple toggling square wave at clock/16/period)
-    const toneStepDivisor = 4; // AY divides clock by 16 for the tone counters' clock
-    let left = 0, right = 0, mono = 0;
-    const mixer = this.mixerByte();
-
+    // トーンジェネレータの更新
+    const toneStepDivisor = 4;
     for (let ch = 0; ch < 3; ch++) {
-    const period = this.getTonePeriod(ch);
-    this.toneCounter[ch] += this.clock / toneStepDivisor / this.sampleRate;
-    if (this.toneCounter[ch] >= period) {
-      this.toneCounter[ch] -= period;
-      this.tonePos[ch] ^= 1;
+      const period = this.getTonePeriod(ch);
+      this.toneCounter[ch] += this.clock / toneStepDivisor / this.sampleRate;
+      if (this.toneCounter[ch] >= period) {
+        this.toneCounter[ch] -= period;
+        this.tonePos[ch] ^= 1;
+      }
     }
-  }
 
-    // noise
+    // ノイズジェネレータの更新
     const noisePeriod = this.getNoisePeriod();
     this.noiseCounter += this.clock / toneStepDivisor / this.sampleRate;
     if (this.noiseCounter >= noisePeriod) {
       this.noiseCounter -= noisePeriod;
-      // 17-bit LFSR
       const bit = ((this.noiseShift ^ (this.noiseShift >> 3)) & 1);
       this.noiseShift = (this.noiseShift >> 1) | (bit << 16);
     }
@@ -639,29 +634,29 @@ class SSG {
 
     this.stepEnvelope();
 
+    let mono = 0;
+    const mixer = this.mixerByte();
+
     for (let ch = 0; ch < 3; ch++) {
       const toneDisabled = (mixer >> ch) & 1;
       const noiseDisabled = (mixer >> (ch + 3)) & 1;
+      
       const toneVal = toneDisabled ? 1 : this.tonePos[ch];
       const noiseVal = noiseDisabled ? 1 : noiseOut;
-      const active = toneVal | noiseVal;
+      
+      // 修正: OR (|) から AND (&) に変更
+      const active = toneVal & noiseVal;
 
       const volReg = this.volReg(ch);
       const useEnv = (volReg & 0x10) !== 0;
       let vol = useEnv ? this.envAtten : (volReg & 0x0f);
 
-     
-     
-    
-    if (active) {
-      mono += SSG_VOL_TABLE[vol] * 0.2; // 実機準拠テーブルを使用
+      // active が 1 の場合のみ音量テーブルから出力値を加算
+      if (active) {
+        mono += SSG_VOL_TABLE[vol] * 0.2;
+      }
     }
-  
-    }
-    
-    // Sum (not average) the three channels so a single active channel still
-    // reaches a strong amplitude; overall headroom is managed by the tanh
-    // limiter in YM2203.renderSample.
+
     return mono;
   }
 }
