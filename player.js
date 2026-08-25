@@ -76,28 +76,6 @@ function buildChannelCells() {
 
 // ---------- File loading ----------
 
-els.dropzone.addEventListener('click', () => els.fileInput.click());
-els.dropzone.addEventListener('keydown', (e) => {
-  if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); els.fileInput.click(); }
-});
-els.btnLoad.addEventListener('click', () => els.fileInput.click());
-
-['dragenter', 'dragover'].forEach(evt => {
-  els.dropzone.addEventListener(evt, (e) => {
-    e.preventDefault();
-    els.dropzone.classList.add('dragover');
-  });
-});
-['dragleave', 'drop'].forEach(evt => {
-  els.dropzone.addEventListener(evt, (e) => {
-    e.preventDefault();
-    els.dropzone.classList.remove('dragover');
-  });
-});
-els.dropzone.addEventListener('drop', (e) => {
-  const file = e.dataTransfer.files && e.dataTransfer.files[0];
-  if (file) loadFile(file);
-});
 els.fileInput.addEventListener('change', () => {
   const file = els.fileInput.files[0];
   if (file) loadFile(file);
