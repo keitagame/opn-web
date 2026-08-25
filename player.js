@@ -237,10 +237,7 @@ function handleWorkletMessage(msg) {
 }
 
 // ---------- Transport controls ----------
-
-els.btnPlay.addEventListener('click', togglePlay);
-els.btnStop.addEventListener('click', stopPlayback);
-els.btnLoop.addEventListener('click', toggleLoop);
+togglePlay();
 
 async function togglePlay() {
   if (!state.loaded) return;
