@@ -72,7 +72,7 @@ function buildChannelCells() {
     state.channelState[def.id] = { active: false, level: 0, decay: 0 };
   }
 }
-buildChannelCells();
+
 
 // ---------- File loading ----------
 
