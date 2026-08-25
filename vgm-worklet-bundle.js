@@ -33,7 +33,10 @@
  */
 
 'use strict';
-
+const SSG_VOL_TABLE = [
+  0.0000, 0.0099, 0.0144, 0.0210, 0.0307, 0.0454, 0.0665, 0.0973,
+  0.1426, 0.2093, 0.3070, 0.4503, 0.6606, 0.9696, 1.4210, 2.0852
+];
 class VGMParser {
   constructor(arrayBuffer) {
     this.buf = new Uint8Array(arrayBuffer);
@@ -260,11 +263,10 @@ for (let i = 0; i < SIN_LEN; i++) {
 // Envelope generator rate tables (simplified OPN-style exponential-ish curve)
 // We implement ADSR in the "attenuation" domain (0 = full volume, 1023 = silence)
 // using standard OPN rate-to-increment approximation.
-function rateToStep(rate, keyScale) {
-  // rate: 0-63 (after key scaling), returns attenuation increment per sample-ish tick
+function rateToStep(rate) {
   if (rate <= 0) return 0;
   const r = Math.min(63, rate);
-  return Math.pow(2, r / 4) * 0.00035;
+  return Math.pow(2, r / 4) * 0.00005; // 0.00035 から縮小
 }
 
 // ---------- FM Operator ----------
@@ -336,24 +338,24 @@ class FMOperator {
         break;
       }
       case 'decay': {
-        const r = this.effRate(this.dr);
-        const step = rateToStep(r) * 40;
-        this.envLevel += step;
-        const slLevel = this.sl >= 15 ? 1023 : this.sl * 64;
-        if (this.envLevel >= slLevel) {
-          this.envLevel = slLevel;
-          this.envState = 'sustain';
-        }
-        break;
-      }
-      case 'sustain': {
-        const r = this.effRate(this.sr);
-        if (r > 0) {
-          const step = rateToStep(r) * 40;
-          this.envLevel += step;
-        }
-        break;
-      }
+  const r = this.effRate(this.dr);
+  const step = rateToStep(r); // * 40 を除去
+  this.envLevel += step;
+  const slLevel = this.sl >= 15 ? 1023 : this.sl * 64;
+  if (this.envLevel >= slLevel) {
+    this.envLevel = slLevel;
+    this.envState = 'sustain';
+  }
+  break;
+}
+case 'sustain': {
+  const r = this.effRate(this.sr);
+  if (r > 0) {
+    const step = rateToStep(r); // * 40 を除去
+    this.envLevel += step;
+  }
+  break;
+}
       case 'release': {
         const r = this.effRate(this.rr * 2 + 1);
         const step = rateToStep(r) * 40;
@@ -369,18 +371,19 @@ class FMOperator {
 
   // Get current output given modulation input (phase modulation, in radians*scale)
   getSample(modInput) {
-    const tlAtten = this.tl * 8; // TL 0..127 -> 0..1016 attenuation units
-    const totalAtten = Math.min(1023, tlAtten + this.envLevel);
-    const amp = Math.pow(10, -totalAtten / (1023 / 3)); // ~3 decades dynamic range
+  const tlAtten = this.tl * 8;
+  const totalAtten = Math.min(1023, tlAtten + this.envLevel);
+  const amp = Math.pow(10, -totalAtten / (1023 / 3));
 
-    let ph = (this.phase + modInput) & (SIN_LEN - 1);
-    ph = ((ph % SIN_LEN) + SIN_LEN) % SIN_LEN;
-    const s = SIN_TABLE[ph] * amp;
-    this.out2 = this.out;
-    this.out = s;
-    return s;
-  }
-
+  // ビット演算 & による小数切り捨てを防ぐため Math.floor を使用
+  let ph = Math.floor(this.phase + modInput) % SIN_LEN;
+  if (ph < 0) ph += SIN_LEN;
+  
+  const s = SIN_TABLE[ph] * amp;
+  this.out2 = this.out;
+  this.out = s;
+  return s;
+}
   step(phaseInc) {
     this.phase = (this.phase + phaseInc) % SIN_LEN;
     this.advanceEnvelope();
@@ -626,13 +629,13 @@ class SSG {
     const mixer = this.mixerByte();
 
     for (let ch = 0; ch < 3; ch++) {
-      const period = this.getTonePeriod(ch);
-      this.toneCounter[ch] += this.clock / toneStepDivisor / this.sampleRate;
-      if (this.toneCounter[ch] >= period) {
-        this.toneCounter[ch] -= period;
-        this.tonePos[ch] ^= 1;
-      }
+    const period = this.getTonePeriod(ch);
+    this.toneCounter[ch] += this.clock / toneStepDivisor / this.sampleRate;
+    if (this.toneCounter[ch] >= period) {
+      this.toneCounter[ch] -= period;
+      this.tonePos[ch] ^= 1;
     }
+  }
 
     // noise
     const noisePeriod = this.getNoisePeriod();
@@ -664,10 +667,17 @@ class SSG {
         mono += amp;
       }
     }
+    for (let ch = 0; ch < 3; ch++) {
+    // ...
+    let vol = useEnv ? this.envAtten : (volReg & 0x0f);
+    if (active) {
+      mono += SSG_VOL_TABLE[vol] * 0.2; // 実機準拠テーブルを使用
+    }
+  }
     // Sum (not average) the three channels so a single active channel still
     // reaches a strong amplitude; overall headroom is managed by the tanh
     // limiter in YM2203.renderSample.
-    return mono * 0.5;
+    return mono;
   }
 }
 
