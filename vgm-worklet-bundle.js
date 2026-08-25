@@ -366,16 +366,15 @@ case 'sustain': {
     if (this.envLevel < 0) this.envLevel = 0;
      
   }
-
-  // Get current output given modulation input (phase modulation, in radians*scale)
- getSample(modInput = 0) {
+getSample(modInput = 0) {
     if (!this.egActive) return 0;
 
-    // 実機仕様: 前段の14bit出力を1bit右シフト(>> 1)して10bit位相(0~1023)に加算
-    const ph = (Math.floor(this.phase) + (modInput >> 1)) & (SIN_LEN - 1);
+    // 位相に変調値を加算（JavaScriptの負数あまり対策含む）
+    let ph = Math.floor(this.phase + modInput) % SIN_LEN;
+    if (ph < 0) ph += SIN_LEN;
 
     const env = this.getEnvelope();
-    this.out = Math.floor(SIN_TABLE[ph] * env); // 出力を14bit整数(-8192～+8191)に保持
+    this.out = SIN_TABLE[ph] * env; // -1.0 ～ +1.0 の浮動小数で保持
 
     return this.out;
   }
@@ -443,58 +442,59 @@ updateOperatorFreqs(sampleRate, clock) {
 
   render() {
     const [op1, op2, op3, op4] = this.ops;
+   const MOD_SCALE = SIN_LEN * 4; // 4096
+
     const fbShift = this.feedback > 0 ? (10 - this.feedback) : 16;
-    const fbMod = this.feedback > 0 ? ((op1.out + op1.out2) >> fbShift) : 0;
-    const MOD_SCALE = SIN_LEN * 1.4;
+    const fbMod = this.feedback > 0 ? ((op1.out + op1.out2) * MOD_SCALE) / Math.pow(2, fbShift) : 0;
 
   let out1, out2, out3, out4, chOut;
 
   switch (this.algorithm) {
     case 0: // op1 -> op2 -> op3 -> op4
       out1 = op1.getSample(fbMod);
-      out2 = op2.getSample(out1);
-      out3 = op3.getSample(out2);
-      out4 = op4.getSample(out3);
+      out2 = op2.getSample(out1 * MOD_SCALE);
+      out3 = op3.getSample(out2 * MOD_SCALE);
+      out4 = op4.getSample(out3 * MOD_SCALE);
       chOut = out4;
       break;
     case 1: // (op1 + op2) -> op3 -> op4
       out1 = op1.getSample(fbMod);
       out2 = op2.getSample(0);
-      out3 = op3.getSample((out1 + out2));
-      out4 = op4.getSample(out3);
+      out3 = op3.getSample((out1 + out2) * MOD_SCALE);
+      out4 = op4.getSample(out3 * MOD_SCALE);
       chOut = out4;
       break;
     case 2: // (op1 & op2) -> op3 -> op4
       out1 = op1.getSample(fbMod);
       out2 = op2.getSample(0);
-      out3 = op3.getSample((out1 + out2));
-      out4 = op4.getSample(out3);
+      out3 = op3.getSample((out1 + out2) * MOD_SCALE);
+      out4 = op4.getSample(out3 * MOD_SCALE);
       chOut = out4;
       break;
     case 3: // op1->op2->op4, op3->op4
       out1 = op1.getSample(fbMod);
-      out2 = op2.getSample(out1);
+      out2 = op2.getSample(out1 * MOD_SCALE);
       out3 = op3.getSample(0);
-      out4 = op4.getSample((out2 + out3));
+      out4 = op4.getSample((out2 + out3) * MOD_SCALE);
       chOut = out4;
       break;
     case 4: // op1->op2, op3->op4
       out1 = op1.getSample(fbMod);
-      out2 = op2.getSample(out1);
+      out2 = op2.getSample(out1 * MOD_SCALE);
       out3 = op3.getSample(0);
-      out4 = op4.getSample(out3);
+      out4 = op4.getSample(out3 * MOD_SCALE);
       chOut = out2 + out4;
       break;
     case 5: // op1 -> (op2, op3, op4)
       out1 = op1.getSample(fbMod);
-      out2 = op2.getSample(out1);
-      out3 = op3.getSample(out1);
-      out4 = op4.getSample(out1);
+      out2 = op2.getSample(out1 * MOD_SCALE);
+      out3 = op3.getSample(out1 * MOD_SCALE);
+      out4 = op4.getSample(out1 * MOD_SCALE);
       chOut = out2 + out3 + out4;
       break;
     case 6: // op1->op2, op3, op4
       out1 = op1.getSample(fbMod);
-      out2 = op2.getSample(out1);
+      out2 = op2.getSample(out1 * MOD_SCALE);
       out3 = op3.getSample(0);
       out4 = op4.getSample(0);
       chOut = out2 + out3 + out4;
