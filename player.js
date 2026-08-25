@@ -151,7 +151,7 @@ async function ensureAudio() {
     numberOfInputs: 0,
     numberOfOutputs: 1,
     outputChannelCount: [2],
-    processorOptions: { vgmSampleRate: 44100 },
+    
   });
 
   const gain = ctx.createGain();
