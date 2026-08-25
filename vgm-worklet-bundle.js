@@ -695,21 +695,22 @@ class YM2203 {
     addr &= 0xff;
     data &= 0xff;
 
-    if (addr === 0x28) {
-      // Key on/off: data bits: bit2-3 = channel select within group... For YM2203 (3 FM ch):
-      // D0-D1: channel (0,1,2), D4-D7: operator key bits
-      const ch = data & 0x03;
-      if (ch > 2) return; // YM2203 only has channels 0-2 for FM
-      const opMask = (data >> 4) & 0x0f;
-      const channel = this.channels[ch];
-      if (opMask === 0) {
-        channel.keyOff(0xf);
-      } else {
-        channel.keyOn(opMask);
-        channel.keyOff((~opMask) & 0xf);
-      }
-      return;
+   if (addr === 0x28) {
+  const ch = data & 0x03;
+  if (ch > 2) return;
+  const opMask = (data >> 4) & 0x0f;
+  const channel = this.channels[ch];
+  
+  // マスクされたオペレータのみをON/OFF制御する
+  for (let i = 0; i < 4; i++) {
+    if (opMask & (1 << i)) {
+      channel.ops[i].setKeyOn(true);
+    } else {
+      channel.ops[i].setKeyOn(false);
     }
+  }
+  return;
+}
 
     if (addr < 0x10) {
       // SSG registers 0x00-0x0F map directly
