@@ -370,15 +370,12 @@ case 'sustain': {
   }
 
   // Get current output given modulation input (phase modulation, in radians*scale)
-  // FMOperator.getSample() 内
-getSample(modInput) {
-  const tlAtten = this.tl * 8; // Total Level (0..127) -> 0..1016
+  getSample(modInput) {
+  const tlAtten = this.tl * 8;
   const totalAtten = Math.min(1023, tlAtten + this.envLevel);
-  
-  // 振幅の計算を OPN(YM2203) の対数テーブル挙動（6dB/bit 近似）に修正
-  // 従来の pow(10, -totalAtten / (1023 / 3)) だと減衰が大きすぎるため緩和
-  const amp = Math.pow(2, -totalAtten / 32);
+  const amp = Math.pow(10, -totalAtten / (1023 / 3));
 
+  // ビット演算 & による小数切り捨てを防ぐため Math.floor を使用
   let ph = Math.floor(this.phase + modInput) % SIN_LEN;
   if (ph < 0) ph += SIN_LEN;
   
