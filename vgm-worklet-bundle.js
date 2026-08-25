@@ -666,14 +666,15 @@ class SSG {
         const amp = vol === 0 ? 0 : Math.pow(2, (vol - 15) / 2);
         mono += amp;
       }
-    }
-    for (let ch = 0; ch < 3; ch++) {
+      for (let ch = 0; ch < 3; ch++) {
     // ...
     let vol = useEnv ? this.envAtten : (volReg & 0x0f);
     if (active) {
       mono += SSG_VOL_TABLE[vol] * 0.2; // 実機準拠テーブルを使用
     }
   }
+    }
+    
     // Sum (not average) the three channels so a single active channel still
     // reaches a strong amplitude; overall headroom is managed by the tanh
     // limiter in YM2203.renderSample.
