@@ -407,19 +407,20 @@ class FMChannel {
     this.block = block;
     for (const op of this.ops) op.blockFnum = (block << 3) | (fnum >> 7 & 0x7); // rough key-scale code approx
   }
-
-  updateOperatorFreqs(sampleRate, clock) {
-    // OPN frequency formula: Fnum/Block -> operator frequency
-    // f = (Fnum * clock) / (144 * 2^(20-Block)) roughly (approximation used widely)
-    const baseFreq = (this.fnum * clock) / (144 * Math.pow(2, 20 - this.block));
-    for (const op of this.ops) {
-      const detuneHz = DETUNE_TABLE[op.det] ? DETUNE_TABLE[op.det][this.block] || 0 : 0;
-      const mul = op.mul === 0 ? 0.5 : op.mul;
-      const f = baseFreq * mul + detuneHz;
-      op.freq = (f / sampleRate) * SIN_LEN;
-    }
+updateOperatorFreqs(sampleRate, clock) {
+  // YM2203のFMクロックは通常 clock / 6 で動作
+  // 正確な周波数 f = (FNUM * (clock / 6)) / (144 * 2^(20 - Block))
+  const fmClock = clock / 6;
+  const baseFreq = (this.fnum * fmClock) / (144 * Math.pow(2, 20 - this.block));
+  
+  for (const op of this.ops) {
+    const detuneHz = DETUNE_TABLE[op.det] ? DETUNE_TABLE[op.det][this.block] || 0 : 0;
+    const mul = op.mul === 0 ? 0.5 : op.mul;
+    const f = baseFreq * mul + detuneHz;
+    // SIN_LEN (1024) に対する1サンプルあたりの位相進み量
+    op.freq = (f / sampleRate) * SIN_LEN;
   }
-
+}
   keyOn(opMask) {
     for (let i = 0; i < 4; i++) {
       if (opMask & (1 << i)) this.ops[i].setKeyOn(true);
