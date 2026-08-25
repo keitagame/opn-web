@@ -161,7 +161,14 @@ class VGMParser {
         const n = this._readU16(p + 1);
         sampleOffset += n;
         p += 3;
-      } else if (cmd === 0x62) {
+      } 
+       else if (cmd === 0x52 || cmd === 0x53 || cmd === 0x56 || cmd === 0x57) {
+        // 0x52/0x56 = Port 0, 0x53/0x57 = Port 1
+        const port = (cmd === 0x53 || cmd === 0x57) ? 1 : 0;
+        const addr = buf[p + 1];
+        const data = buf[p + 2];
+        this.events.push({ sampleOffset, type: 'ym2608', port, addr, data });
+        p += 3;}else if (cmd === 0x62) {
         sampleOffset += 735; // 1/60s wait
         p += 1;
       } else if (cmd === 0x63) {
