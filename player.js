@@ -103,14 +103,14 @@ async function loadFile(file) {
       setStatus(`読み込み完了: ${file.name}`);
     }
 
-    populateMeta(parser, file.name);
+    //populateMeta(parser, file.name);
     await ensureAudio();
     await sendLoadToWorklet(parser);
     await togglePlay();
     els.rack.hidden = false;
     state.loaded = true;
     updateSeekRange();
-    startAnimLoop();
+   
   } catch (err) {
     console.error(err);
     setStatus(`エラー: ${err.message}`);
@@ -279,7 +279,7 @@ function samplesToTime(samples) {
 // ---------- Status ----------
 
 function setStatus(text) {
-  els.statusText.textContent = text;
+ 
 }
 
 // ---------- Oscilloscope + channel activity animation loop ----------
