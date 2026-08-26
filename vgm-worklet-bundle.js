@@ -174,12 +174,6 @@ class VGMParser {
       } else if (cmd === 0x63) {
         sampleOffset += 882; // 1/50s wait
         p += 1;
-        } else if (cmd === 0x67) {
-        const type = buf[p + 2];
-        const size = this._readU32(p + 3);
-        this.dataBlocks.push({ type, data: buf.subarray(p + 7, p + 7 + size) });
-        p += 7 + size;
-      
       } else if (cmd >= 0x70 && cmd <= 0x7f) {
         // wait 0-15 samples
         sampleOffset += (cmd & 0x0f) + 1;
@@ -677,162 +671,7 @@ class SSG {
     return mono;
   }
 }
-class OPNARhythm {
-  constructor(sampleRate) {
-    this.sampleRate = sampleRate;
-    this.totalVol = 63;
-    this.vols = new Uint8Array(6).fill(31);
-    this.env = new Float32Array(6).fill(0);
-    this.freqs = [150, 180, 800, 3000, 200, 800];
-    this.phases = new Float32Array(6).fill(0);
-    this.noiseShift = 0x1234;
-  }
 
-  writeReg(addr, data) {
-    if (addr === 0x10) {
-      for (let ch = 0; ch < 6; ch++) {
-        if (data & (1 << ch)) {
-          this.env[ch] = 1.0;
-          this.phases[ch] = 0;
-        }
-      }
-    } else if (addr === 0x11) {
-      this.totalVol = data & 0x3f;
-    } else if (addr >= 0x18 && addr <= 0x1d) {
-      this.vols[addr - 0x18] = data & 0x1f;
-    }
-  }
-
-  render() {
-    let out = 0;
-    const totalGain = Math.pow(10, -(63 - this.totalVol) / 20);
-
-    for (let ch = 0; ch < 6; ch++) {
-      if (this.env[ch] <= 0.001) continue;
-
-      const gain = Math.pow(10, -(31 - this.vols[ch]) / 20) * this.env[ch];
-      this.noiseShift = (this.noiseShift >> 1) ^ ((this.noiseShift & 1) ? 0x12000 : 0);
-      const noise = ((this.noiseShift & 1) * 2 - 1);
-
-      let sample = 0;
-      this.phases[ch] += (this.freqs[ch] / this.sampleRate) * Math.PI * 2;
-
-      switch (ch) {
-        case 0: sample = Math.sin(this.phases[ch] * (1 + this.env[ch] * 2)); this.env[ch] *= 0.9985; break; // BD
-        case 1: sample = Math.sin(this.phases[ch]) * 0.4 + noise * 0.6; this.env[ch] *= 0.996; break;       // SD
-        case 2:                                                                                             // TOP
-        case 3: sample = noise; this.env[ch] *= (ch === 3 ? 0.992 : 0.997); break;                          // HH
-        case 4: sample = Math.sin(this.phases[ch] * (1 + this.env[ch])); this.env[ch] *= 0.997; break;      // TOM
-        case 5: sample = noise * 0.3 + Math.sin(this.phases[ch]) * 0.7; this.env[ch] *= 0.985; break;       // RIM
-      }
-
-      out += sample * gain;
-    }
-    return out * totalGain * 0.25;
-  }
-}
-
-class YM2608 {
-  constructor(sampleRate, clock) {
-    this.sampleRate = sampleRate;
-    this.clock = clock || 7987200;
-    this.channels = Array.from({ length: 6 }, () => new FMChannel());
-    this.ssg = new SSG(sampleRate, this.clock / 4);
-    this.rhythm = new OPNARhythm(sampleRate);
-    this._pendingFnumLo = new Uint8Array(6);
-    this._pendingFnumHi = new Uint8Array(6);
-  }
-
-  write(port, addr, data) {
-    addr &= 0xff;
-    data &= 0xff;
-
-    if (port === 0 && addr === 0x28) {
-      const chNum = data & 0x03;
-      if (chNum === 3) return;
-      const ch = (data & 0x04 ? 3 : 0) + chNum;
-      const opMask = (data >> 4) & 0x0f;
-      const channel = this.channels[ch];
-      if (channel) {
-        for (let i = 0; i < 4; i++) channel.ops[i].setKeyOn((opMask & (1 << i)) !== 0);
-      }
-      return;
-    }
-
-    if (port === 0 && addr >= 0x10 && addr <= 0x1d) {
-      this.rhythm.writeReg(addr, data);
-      return;
-    }
-
-    if (port === 0 && addr < 0x10) {
-      this.ssg.writeReg(addr, data);
-      return;
-    }
-
-    if (addr >= 0x30 && addr < 0xa0) {
-      const opSelGroup = addr & 0x03;
-      if (opSelGroup > 2) return;
-      const chSel = opSelGroup + (port * 3);
-      const opSel = (addr >> 2) & 0x03;
-      const regGroup = addr & 0xf0;
-      const channel = this.channels[chSel];
-      if (!channel) return;
-      const op = channel.ops[OP_ORDER[opSel]];
-
-      switch (regGroup) {
-        case 0x30: op.mul = data & 0x0f; op.det = (data >> 4) & 0x07; this._updateFreq(channel); break;
-        case 0x40: op.tl = data & 0x7f; break;
-        case 0x50: op.ks = (data >> 6) & 0x03; op.ar = data & 0x1f; break;
-        case 0x60: op.dr = data & 0x1f; break;
-        case 0x70: op.sr = data & 0x1f; break;
-        case 0x80: op.sl = (data >> 4) & 0x0f; op.rr = data & 0x0f; break;
-      }
-      return;
-    }
-
-    const chBase = port * 3;
-    if (addr >= 0xa0 && addr <= 0xa2) {
-      const ch = (addr - 0xa0) + chBase;
-      this._pendingFnumLo[ch] = data;
-      this._applyFreq(ch);
-    } else if (addr >= 0xa4 && addr <= 0xa6) {
-      const ch = (addr - 0xa4) + chBase;
-      this._pendingFnumHi[ch] = data;
-      this._applyFreq(ch);
-    } else if (addr >= 0xb0 && addr <= 0xb2) {
-      const ch = (addr - 0xb0) + chBase;
-      const channel = this.channels[ch];
-      if (channel) {
-        channel.algorithm = data & 0x07;
-        channel.feedback = (data >> 3) & 0x07;
-      }
-    }
-  }
-
-  _applyFreq(ch) {
-    const fnum = ((this._pendingFnumHi[ch] & 0x07) << 8) | this._pendingFnumLo[ch];
-    const block = (this._pendingFnumHi[ch] >> 3) & 0x07;
-    const channel = this.channels[ch];
-    if (channel) {
-      channel.setFNumBlock(fnum, block);
-      this._updateFreq(channel);
-    }
-  }
-
-  _updateFreq(channel) {
-    channel.updateOperatorFreqs(this.sampleRate, this.clock);
-  }
-
-  renderSample() {
-    let fmOut = 0;
-    for (const ch of this.channels) fmOut += ch.render();
-    const ssgOut = this.ssg.render();
-    const rhythmOut = this.rhythm.render();
-
-    const mix = fmOut * 0.35 + ssgOut * 0.35 + rhythmOut * 0.3;
-    return Math.tanh(mix * 1.15);
-  }
-}
 // ---------- YM2203 top-level chip ----------
 
 const OPN_ALGORITHMS_OPS = 4;
@@ -1005,7 +844,7 @@ class VGMPlayerProcessor extends AudioWorkletProcessor {
     super();
     const { vgmSampleRate } = options.processorOptions || {};
     this.vgmRate = vgmSampleRate || 44100;
-    this.chip = new YM2608(this.vgmRate, 7987200);
+    this.chip = new YM2203(this.vgmRate, 3993600);
     this.events = [];
     this.eventIndex = 0;
     this.totalSamples = 0;
@@ -1014,12 +853,14 @@ class VGMPlayerProcessor extends AudioWorkletProcessor {
     this.playing = false;
     this.loopEnabled = true;
     this.ended = false;
-    this.outAccumPos = 0;
+
+    this.outAccumPos = 0; // fractional position for resampling
     this.lastL = 0;
 
     this.port.onmessage = (e) => this._onMessage(e.data);
   }
-_onMessage(msg) {
+
+  _onMessage(msg) {
     switch (msg.type) {
       case 'load':
         this.events = msg.events;
@@ -1027,8 +868,9 @@ _onMessage(msg) {
         this.loopSampleOffset = msg.loopSampleOffset;
         this.eventIndex = 0;
         this.currentSample = 0;
-        const clock = msg.ym2608Clock || msg.ym2203Clock || 7987200;
-        this.chip = new YM2608(this.vgmRate, clock);
+        const clock = msg.clock || msg.ym2608Clock || msg.ym2203Clock || 7987200;
+        this.chip = new YM2203(this.vgmRate, clock);
+        //this.chip = new YM2203(this.vgmRate, msg.clock || 3993600);
         this.ended = false;
         this.playing = false;
         this.port.postMessage({ type: 'loaded' });
@@ -1039,6 +881,9 @@ _onMessage(msg) {
       case 'pause':
         this.playing = false;
         break;
+      case 'seekSample':
+        this._seek(msg.sample);
+        break;
       case 'setLoop':
         this.loopEnabled = msg.value;
         break;
@@ -1046,7 +891,7 @@ _onMessage(msg) {
         this.playing = false;
         this.currentSample = 0;
         this.eventIndex = 0;
-        this.chip = new YM2608(this.vgmRate, this.chip.clock);
+        this.chip = new YM2203(this.vgmRate, this.chip.clock);
         break;
     }
   }
