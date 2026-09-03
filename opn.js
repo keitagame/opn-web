@@ -1,4 +1,5 @@
 'use strict';
+
 const SSG_VOL_TABLE = [
   0.0000, 0.0047, 0.0069, 0.0101, 0.0147, 0.0218, 0.0319, 0.0467,
   0.0684, 0.1004, 0.1472, 0.2159, 0.3168, 0.4650, 0.6815, 1.0000
@@ -27,14 +28,14 @@ class VGMParser {
     this.gd3 = null;
     this.events = []; // { sampleOffset, type, ...data }
     this.totalSamples = 0;
-    this.loopSampleOffset = -1; // sample index where loop begins, -1 if none
+    this.loopSampleOffset = -1;
+    this.adpcmRam = null;
     this._parse();
   }
 
   _readU32(off) { return this.view.getUint32(off, true); }
   _readU16(off) { return this.view.getUint16(off, true); }
   _readU8(off) { return this.view.getUint8(off); }
-  _readI32(off) { return this.view.getInt32(off, true); }
 
   _magic(off) {
     return String.fromCharCode(this.buf[off], this.buf[off + 1], this.buf[off + 2], this.buf[off + 3]);
@@ -55,7 +56,8 @@ class VGMParser {
     h.loopSamples = this._readU32(0x20);
 
     h.ym2203Clock = 0;
-    h.dataOffset = 0x40; // default for older versions
+    h.ym2608Clock = 0;
+    h.dataOffset = 0x40;
 
     if (h.version >= 0x101) {
       h.rate = this._readU32(0x24);
@@ -68,21 +70,9 @@ class VGMParser {
       h.ym2203Clock = this._readU32(0x44);
       h.ym2608Clock = this._readU32(0x48);
     }
-    if (this.buf.length > 0x4c && h.version >= 0x151) {
-      h.ym2610Clock = this._readU32(0x4c);
-    }
-
-    if (!h.ym2203Clock && this.buf.length > 0x44) {
-      const maybe = this._readU32(0x44);
-      if (maybe > 100000 && maybe < 10000000) h.ym2203Clock = maybe;
-    }
 
     this.totalSamples = h.totalSamples;
-    if (h.loopOffset) {
-      this.loopByteOffset = h.loopOffset + 0x1c;
-    } else {
-      this.loopByteOffset = -1;
-    }
+    this.loopByteOffset = h.loopOffset ? h.loopOffset + 0x1c : -1;
 
     if (h.gd3Offset) {
       this._parseGD3(h.gd3Offset + 0x14);
@@ -170,17 +160,20 @@ class VGMParser {
       } else if (cmd >= 0x80 && cmd <= 0x8f) {
         sampleOffset += (cmd & 0x0f);
         p += 1;
-      } else if (cmd === 0x50) {
-        p += 2;
-      } else if (cmd === 0x54) {
-        p += 3;
-      } else if (cmd === 0x5a || cmd === 0x5b || cmd === 0x5c || cmd === 0x5d || cmd === 0x5e || cmd === 0x5f) {
-        p += 3;
-      } else if (cmd === 0xa0) {
-        p += 3;
-      } else if (cmd === 0x67) {
+      } else if (cmd === 0x67) { // Data block (ADPCM RAM)
+        const dataType = buf[p + 2];
         const size = this._readU32(p + 3);
+        if (dataType === 0x81 || dataType === 0x01) {
+          const startAddr = this._readU32(p + 7);
+          const dataSlice = buf.subarray(p + 11, p + 7 + size);
+          if (!this.adpcmRam) this.adpcmRam = new Uint8Array(256 * 1024);
+          this.adpcmRam.set(dataSlice, startAddr);
+        }
         p += 7 + size;
+      } else if (cmd === 0x50 || cmd >= 0x30 && cmd <= 0x3f) {
+        p += 2;
+      } else if (cmd === 0x54 || (cmd >= 0x40 && cmd <= 0x4e) || (cmd >= 0x5a && cmd <= 0x5f) || cmd === 0xa0) {
+        p += 3;
       } else if (cmd >= 0x90 && cmd <= 0x95) {
         if (cmd === 0x90 || cmd === 0x91 || cmd === 0x95) p += 5;
         else if (cmd === 0x92) p += 6;
@@ -188,10 +181,6 @@ class VGMParser {
         else if (cmd === 0x94) p += 2;
       } else if (cmd === 0xe0) {
         p += 5;
-      } else if (cmd >= 0x30 && cmd <= 0x3f) {
-        p += 2;
-      } else if (cmd >= 0x40 && cmd <= 0x4e) {
-        p += 3;
       } else {
         this.events.push({ sampleOffset, type: 'end' });
         break;
@@ -336,8 +325,8 @@ class FMChannel {
     this.feedback = 0;
     this.block = 4;
     this.fnum = 0;
-    this.freqBase = 0;
-    this.pan = 3;
+    this.panLeft = true;
+    this.panRight = true;
   }
 
   setFNumBlock(fnum, block) {
@@ -414,7 +403,7 @@ class FMChannel {
         out2 = op2.getSample(out1 * MOD_SCALE);
         out3 = op3.getSample(out1 * MOD_SCALE);
         out4 = op4.getSample(out1 * MOD_SCALE);
-        chOut = out2 + out3 + out4;
+        chOut = op2 + out3 + out4;
         break;
       case 6:
         out1 = op1.getSample(fbMod);
@@ -498,12 +487,7 @@ class SSG {
         if (this.envPos >= 32) {
           this.envPos = 0;
           const cont = (shape & 0x08) !== 0;
-          const hold = (shape & 0x01) !== 0;
-          if (!cont) {
-            this.envHold = true;
-          } else if (hold) {
-            this.envHold = true;
-          }
+          if (!cont) this.envHold = true;
         }
       }
     }
@@ -525,9 +509,7 @@ class SSG {
       let rising = attackDir;
       if (alt && (cycleNum % 2 === 1)) rising = !rising;
       level = rising ? cyclePos : (15 - cyclePos);
-      if (hold && pos >= 16 && !alt) {
-        level = attackDir ? 15 : 0;
-      }
+      if (hold && pos >= 16 && !alt) level = attackDir ? 15 : 0;
     }
     this.envAtten = Math.max(0, Math.min(15, level));
   }
@@ -578,22 +560,283 @@ class SSG {
   }
 }
 
-const OP_ORDER = [0, 2, 1, 3];
+// ---------- YM2608 特有機能（リズム音源 & ADPCM） ----------
 
-class YM2203 {
+class YM2608Rhythm {
+  constructor(sampleRate) {
+    this.sampleRate = sampleRate;
+    this.regs = new Uint8Array(0x20);
+    this.buffers = [];
+    this.positions = [0, 0, 0, 0, 0, 0];
+    this.active = [false, false, false, false, false, false];
+    this._generateSamples();
+  }
+
+  _generateSamples() {
+    const sr = 16000;
+    
+    // 0: BD
+    const bdLen = Math.floor(sr * 0.18);
+    const bd = new Float32Array(bdLen);
+    let bdPhase = 0;
+    for (let i = 0; i < bdLen; i++) {
+      const t = i / sr;
+      const freq = 140 * Math.exp(-t * 30) + 35;
+      bdPhase += (freq / sr) * Math.PI * 2;
+      bd[i] = Math.sin(bdPhase) * Math.exp(-t * 22) * 1.2;
+    }
+    this.buffers.push(bd);
+
+    // 1: SD
+    const sdLen = Math.floor(sr * 0.18);
+    const sd = new Float32Array(sdLen);
+    let sdPhase = 0;
+    for (let i = 0; i < sdLen; i++) {
+      const t = i / sr;
+      const freq = 220 * Math.exp(-t * 25) + 80;
+      sdPhase += (freq / sr) * Math.PI * 2;
+      const tone = Math.sin(sdPhase) * Math.exp(-t * 28);
+      const noise = (Math.random() * 2 - 1) * Math.exp(-t * 18);
+      sd[i] = (tone * 0.5 + noise * 0.7);
+    }
+    this.buffers.push(sd);
+
+    // 2: TC
+    const tcLen = Math.floor(sr * 0.4);
+    const tc = new Float32Array(tcLen);
+    for (let i = 0; i < tcLen; i++) {
+      const t = i / sr;
+      const n1 = Math.sin(i * 3.14) > 0 ? 1 : -1;
+      const n2 = Math.sin(i * 4.37) > 0 ? 1 : -1;
+      const n3 = Math.sin(i * 5.82) > 0 ? 1 : -1;
+      tc[i] = (n1 + n2 + n3 + (Math.random() * 2 - 1)) * 0.25 * Math.exp(-t * 7);
+    }
+    this.buffers.push(tc);
+
+    // 3: HH
+    const hhLen = Math.floor(sr * 0.06);
+    const hh = new Float32Array(hhLen);
+    let prevN = 0;
+    for (let i = 0; i < hhLen; i++) {
+      const t = i / sr;
+      const raw = Math.random() * 2 - 1;
+      const hp = raw - prevN * 0.6;
+      prevN = raw;
+      hh[i] = hp * Math.exp(-t * 55) * 0.8;
+    }
+    this.buffers.push(hh);
+
+    // 4: TOM
+    const tomLen = Math.floor(sr * 0.16);
+    const tom = new Float32Array(tomLen);
+    let tomPhase = 0;
+    for (let i = 0; i < tomLen; i++) {
+      const t = i / sr;
+      const freq = 180 * Math.exp(-t * 20) + 60;
+      tomPhase += (freq / sr) * Math.PI * 2;
+      tom[i] = Math.sin(tomPhase) * Math.exp(-t * 18) * 1.1;
+    }
+    this.buffers.push(tom);
+
+    // 5: RIM
+    const rimLen = Math.floor(sr * 0.05);
+    const rim = new Float32Array(rimLen);
+    let rimPhase = 0;
+    for (let i = 0; i < rimLen; i++) {
+      const t = i / sr;
+      rimPhase += (850 / sr) * Math.PI * 2;
+      const tone = Math.sin(rimPhase);
+      const click = i < 10 ? (Math.random() * 2 - 1) : 0;
+      rim[i] = (tone * 0.6 + click * 0.8) * Math.exp(-t * 80);
+    }
+    this.buffers.push(rim);
+  }
+
+  write(addr, data) {
+    if (addr < 0x20) this.regs[addr] = data;
+    if (addr === 0x10) {
+      if (data & 0x80) {
+        for (let i = 0; i < 6; i++) this.active[i] = false;
+      } else {
+        for (let i = 0; i < 6; i++) {
+          if ((data & (1 << i)) !== 0) {
+            this.positions[i] = 0;
+            this.active[i] = true;
+          }
+        }
+      }
+    }
+  }
+
+  render() {
+    const totalVolReg = this.regs[0x11] & 0x3f;
+    const totalVol = Math.pow(10, -(totalVolReg * 0.75) / 20);
+
+    let sumL = 0, sumR = 0;
+    const stepRatio = 16000 / this.sampleRate;
+
+    for (let i = 0; i < 6; i++) {
+      if (!this.active[i]) continue;
+      const buf = this.buffers[i];
+      const pos = Math.floor(this.positions[i]);
+      if (pos >= buf.length) {
+        this.active[i] = false;
+        continue;
+      }
+      const rawSample = buf[pos];
+      this.positions[i] += stepRatio;
+
+      const instReg = this.regs[0x18 + i];
+      const panL = (instReg & 0x80) !== 0 || instReg === 0;
+      const panR = (instReg & 0x40) !== 0 || instReg === 0;
+      const instVol = instReg & 0x1f;
+      const vol = Math.pow(10, -((31 - instVol) * 1.0) / 20) * totalVol;
+
+      const s = rawSample * vol;
+      if (panL) sumL += s;
+      if (panR) sumR += s;
+    }
+    return [sumL, sumR];
+  }
+}
+
+const ADPCM_STEPS = [
+  16, 17, 19, 21, 23, 25, 28, 31, 34, 37, 41, 45, 50, 55, 60, 66,
+  73, 80, 88, 97, 107, 118, 130, 143, 157, 173, 190, 209, 230, 253,
+  279, 307, 337, 371, 408, 449, 494, 544, 598, 658, 724, 796, 876, 963,
+  1060, 1166, 1282, 1411, 1552
+];
+
+const ADPCM_INDEX_ADJ = [-1, -1, -1, -1, 2, 4, 6, 8];
+
+class YM2608ADPCM {
   constructor(sampleRate, clock) {
     this.sampleRate = sampleRate;
-    this.clock = clock || 3993600;
+    this.clock = clock || 7987200;
+    this.ram = null;
+    this.regs = new Uint8Array(0x20);
+
+    this.playing = false;
+    this.startAddr = 0;
+    this.stopAddr = 0;
+    this.nibblePos = 0;
+    this.valpred = 0;
+    this.stepIndex = 0;
+    this.phase = 0;
+    this.lastSample = 0;
+  }
+
+  setRam(ramBuffer) {
+    this.ram = ramBuffer;
+  }
+
+  write(addr, data) {
+    if (addr < 0x20) this.regs[addr] = data;
+    if (addr === 0x00) {
+      if (data & 0x80) {
+        this.startAddr = (((this.regs[0x03] << 8) | this.regs[0x02])) << 3;
+        this.stopAddr = ((((this.regs[0x05] << 8) | this.regs[0x04]) + 1)) << 3;
+        this.nibblePos = this.startAddr * 2;
+        this.valpred = 0;
+        this.stepIndex = 0;
+        this.playing = (data & 0x20) !== 0 || (data & 0x80) !== 0;
+      }
+      if (data & 0x01) {
+        this.playing = false;
+      }
+    }
+  }
+
+  _decodeNextNibble() {
+    if (!this.ram) return 0;
+    const byteAddr = Math.floor(this.nibblePos / 2);
+    if (byteAddr >= this.stopAddr || byteAddr >= this.ram.length) {
+      this.playing = false;
+      return 0;
+    }
+    const b = this.ram[byteAddr];
+    const nibble = (this.nibblePos % 2 === 0) ? ((b >> 4) & 0x0f) : (b & 0x0f);
+    this.nibblePos++;
+
+    let step = ADPCM_STEPS[this.stepIndex];
+    let diff = step >> 3;
+    if (nibble & 1) diff += step >> 2;
+    if (nibble & 2) diff += step >> 1;
+    if (nibble & 4) diff += step;
+    if (nibble & 8) this.valpred -= diff; else this.valpred += diff;
+    if (this.valpred > 32767) this.valpred = 32767;
+    if (this.valpred < -32768) this.valpred = -32768;
+
+    this.stepIndex += ADPCM_INDEX_ADJ[nibble & 7];
+    if (this.stepIndex < 0) this.stepIndex = 0;
+    if (this.stepIndex > 48) this.stepIndex = 48;
+
+    return this.valpred / 32768.0;
+  }
+
+  render() {
+    if (!this.playing || !this.ram) return [0, 0];
+
+    const deltaN = (this.regs[0x0a] << 8) | this.regs[0x09];
+    const adpcmClock = (deltaN / 65536.0) * 16000.0;
+    const stepRatio = adpcmClock / this.sampleRate;
+
+    this.phase += stepRatio;
+    while (this.phase >= 1.0) {
+      this.phase -= 1.0;
+      this.lastSample = this._decodeNextNibble();
+      if (!this.playing) break;
+    }
+
+    const panReg = this.regs[0x01];
+    const panL = (panReg & 0x80) !== 0 || panReg === 0;
+    const panR = (panReg & 0x40) !== 0 || panReg === 0;
+    const level = (this.regs[0x0b] || 255) / 255.0;
+
+    const s = this.lastSample * level;
+    return [panL ? s : 0, panR ? s : 0];
+  }
+}
+
+const OP_ORDER = [0, 2, 1, 3];
+
+class YM2608 {
+  constructor(sampleRate, clock) {
+    this.sampleRate = sampleRate;
+    this.clock = clock || 7987200;
     this.channels = Array.from({ length: 6 }, () => new FMChannel());
-    this.ssg = new SSG(sampleRate, this.clock / 2);
-    this.selectedRegPart0 = 0;
-    this.prescaler = 6;
-    this.lastKeyOnReg = 0;
+    this.ssg = new SSG(sampleRate, this.clock / 4);
+    this.rhythm = new YM2608Rhythm(sampleRate);
+    this.adpcm = new YM2608ADPCM(sampleRate, this.clock);
+  }
+
+  setAdpcmRam(ram) {
+    this.adpcm.setRam(ram);
   }
 
   write(port, addr, data) {
     addr &= 0xff;
     data &= 0xff;
+
+    // Rhythm (Port 0, 0x10 - 0x1D)
+    if (port === 0 && addr >= 0x10 && addr <= 0x1d) {
+      this.rhythm.write(addr, data);
+      return;
+    }
+
+    // SSG (Port 0, 0x00 - 0x0F)
+    if (port === 0 && addr < 0x10) {
+      this.ssg.writeReg(addr, data);
+      return;
+    }
+
+    // ADPCM (Port 1, 0x00 - 0x10)
+    if (port === 1 && addr <= 0x10) {
+      this.adpcm.write(addr, data);
+      return;
+    }
+
+    // FM Key On / Off (Port 0, 0x28)
     if (port === 0 && addr === 0x28) {
       const chBits = data & 0x07;
       if ((chBits & 0x03) === 3) return;
@@ -606,14 +849,7 @@ class YM2203 {
       return;
     }
 
-    if (port === 0 && addr < 0x10) {
-      this.ssg.writeReg(addr, data);
-      return;
-    }
-    if (addr === 0x2d || addr === 0x2e || addr === 0x2f) {
-      return;
-    }
-
+    // FM Operator parameters
     if (addr >= 0x30 && addr < 0xa0) {
       const opSelGroup = addr & 0x03;
       if (opSelGroup > 2) return;
@@ -658,6 +894,13 @@ class YM2203 {
         channel.feedback = (data >> 3) & 0x07;
         break;
       }
+      case 0xb4: case 0xb5: case 0xb6: {
+        const ch = (addr - 0xb4) + chBase;
+        const channel = this.channels[ch];
+        channel.panLeft = (data & 0x80) !== 0;
+        channel.panRight = (data & 0x40) !== 0;
+        break;
+      }
     }
   }
 
@@ -676,16 +919,29 @@ class YM2203 {
   }
 
   renderSample() {
-    let fmOut = 0;
+    let fmOutL = 0;
+    let fmOutR = 0;
     for (const ch of this.channels) {
-      fmOut += ch.render();
+      const s = ch.render();
+      if (ch.panLeft) fmOutL += s;
+      if (ch.panRight) fmOutR += s;
     }
 
-    const ssgOut = this.ssg.render();
-    const mix = fmOut * 0.65 + ssgOut * 0.8;
-    return Math.max(-1, Math.min(1, mix));
+    const ssgOut = this.ssg.render() * 0.8;
+    const [rhythmL, rhythmR] = this.rhythm.render();
+    const [adpcmL, adpcmR] = this.adpcm.render();
+
+    const mixL = fmOutL * 0.5 + ssgOut + rhythmL * 0.6 + adpcmL * 0.6;
+    const mixR = fmOutR * 0.5 + ssgOut + rhythmR * 0.6 + adpcmR * 0.6;
+
+    return [
+      Math.max(-1, Math.min(1, mixL)),
+      Math.max(-1, Math.min(1, mixR))
+    ];
   }
 }
+
+const YM2203 = YM2608;
 
 // ---------- メインスレッド用 VGM プレイヤークラス (AudioWorklet 非使用) ----------
 
@@ -693,7 +949,7 @@ class VGMPlayer {
   constructor(audioCtx, vgmSampleRate = 44100) {
     this.audioCtx = audioCtx;
     this.vgmRate = vgmSampleRate;
-    this.chip = new YM2203(this.vgmRate, 3993600);
+    this.chip = new YM2608(this.vgmRate, 7987200);
     this.events = [];
     this.eventIndex = 0;
     this.totalSamples = 0;
@@ -705,14 +961,13 @@ class VGMPlayer {
 
     this.outAccumPos = 0;
     this.lastL = 0;
+    this.lastR = 0;
     this._posCounter = 0;
 
-    // イベント通知用コールバック
     this.onPosition = null;
     this.onEnded = null;
     this.onLooped = null;
 
-    // ScriptProcessorNode (バッファサイズ: 4096, 入力: 0, 出力: 2)
     this.node = this.audioCtx.createScriptProcessor(4096, 0, 2);
     this.node.onaudioprocess = (e) => this._process(e);
   }
@@ -733,8 +988,11 @@ class VGMPlayer {
     this.currentSample = 0;
     
     const h = vgmParser.header;
-    const clock = h.ym2608Clock || h.ym2203Clock || 3993600;
-    this.chip = new YM2203(this.vgmRate, clock);
+    const clock = h.ym2608Clock || h.ym2203Clock || 7987200;
+    this.chip = new YM2608(this.vgmRate, clock);
+    if (vgmParser.adpcmRam) {
+      this.chip.setAdpcmRam(vgmParser.adpcmRam);
+    }
     this.ended = false;
     this.playing = false;
   }
@@ -751,11 +1009,11 @@ class VGMPlayer {
     this.playing = false;
     this.currentSample = 0;
     this.eventIndex = 0;
-    this.chip = new YM2203(this.vgmRate, this.chip.clock);
+    this.chip = new YM2608(this.vgmRate, this.chip.clock);
   }
 
   seekSample(targetSample) {
-    this.chip = new YM2203(this.vgmRate, this.chip.clock);
+    this.chip = new YM2608(this.vgmRate, this.chip.clock);
     let i = 0;
     while (i < this.events.length && this.events[i].sampleOffset <= targetSample) {
       const ev = this.events[i];
@@ -816,16 +1074,22 @@ class VGMPlayer {
       }
 
       this.outAccumPos += ratio;
-      let s = this.lastL;
+      let [sL, sR] = [this.lastL, this.lastR];
       while (this.outAccumPos >= 1) {
-        s = this._advanceOneVgmSample();
+        const res = this._advanceOneVgmSample();
+        if (Array.isArray(res)) {
+          [sL, sR] = res;
+        } else {
+          sL = sR = res;
+        }
         this.outAccumPos -= 1;
         if (this.ended) break;
       }
-      this.lastL = s;
-      const clipped = Math.max(-1, Math.min(1, s));
-      left[i] = clipped;
-      right[i] = clipped;
+      this.lastL = sL;
+      this.lastR = sR;
+
+      left[i] = Math.max(-1, Math.min(1, sL));
+      right[i] = Math.max(-1, Math.min(1, sR));
     }
 
     this._posCounter += left.length;
@@ -839,5 +1103,5 @@ class VGMPlayer {
 }
 
 if (typeof module !== 'undefined') {
-  module.exports = { VGMParser, YM2203, VGMPlayer };
+  module.exports = { VGMParser, YM2203, YM2608, VGMPlayer };
 }
