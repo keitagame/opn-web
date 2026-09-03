@@ -403,7 +403,7 @@ class FMChannel {
         out2 = op2.getSample(out1 * MOD_SCALE);
         out3 = op3.getSample(out1 * MOD_SCALE);
         out4 = op4.getSample(out1 * MOD_SCALE);
-        chOut = op2 + out3 + out4;
+        chOut = out2 + out3 + out4;
         break;
       case 6:
         out1 = op1.getSample(fbMod);
@@ -500,9 +500,9 @@ class SSG {
 
     let level;
     if (!cont) {
-      level = attackDir ? Math.max(0, 15 - pos) : Math.max(0, 15 - pos);
-      if (pos >= 15) level = attackDir ? 15 : 0;
-      if (hold && pos >= 15) level = attackDir ? 0 : 0;
+      // 非継続 (cont=0): 1周期だけ動いて、その後は 0 に固定される
+      level = attackDir ? Math.min(15, pos) : Math.max(0, 15 - pos);
+      if (pos >= 15) level = 0;
     } else {
       const cyclePos = pos % 16;
       const cycleNum = Math.floor(pos / 16);
