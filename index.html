@@ -235,12 +235,105 @@ const PMS_CENTS = [0, 3.4, 6.7, 10, 14, 20, 40, 80];
 const OP_ORDER = [0, 2, 1, 3];                                // レジスタ上のスロット順 S1,S3,S2,S4 → op1..op4
 
 // =====================================================================
+//  高音質化 (実機互換ではない)
+//   ・FM をネイティブレートの N 倍で合成し、折り返しノイズ(エイリアシング)を除去
+//   ・サイン波/エンベロープを浮動小数点で計算 (実機の対数表の量子化ノイズを排除)
+//   ・高次ローパスで折り返しを抑えつつ、FM の耳に刺さる高域をハイシェルフで抑える
+// =====================================================================
+const HQ = {
+  fmOversample: 4,        // FM 合成のオーバーサンプリング倍率 (2~8。大きいほど高音質・高負荷)
+  fmLowpassHz: 14000,     // FM の高域カット周波数 (8次バターワース)
+  fmShelfHz: 4500,        // FM ハイシェルフの開始周波数
+  fmShelfDb: -4,          // FM ハイシェルフの量[dB] (0 で無効。負の値でキツい高音を抑える)
+  ssgLowpassHz: 15000,    // SSG の高域カット周波数
+};
+const FM_OS = Math.max(2, Math.min(8, HQ.fmOversample | 0));
+
+const SIN_N = 4096;
+const SIN_TAB = new Float64Array(SIN_N + 1);
+for (let i = 0; i <= SIN_N; i++) SIN_TAB[i] = Math.sin((2 * Math.PI * i) / SIN_N);
+
+// 減衰量 att(1 = 約0.094dB) → 振幅。ピークは実機と同じ約 ±8176
+const ENV_AMP = new Float64Array(0x400);
+for (let e = 0; e < 0x400; e++) ENV_AMP[e] = 8176 * Math.pow(2, -e / 64);
+ENV_AMP[0x3ff] = 0;
+
+const FB_SCALE = [0, 0, 0, 0, 0, 0, 0, 0];
+for (let f = 1; f < 8; f++) FB_SCALE[f] = Math.pow(2, f - 10);
+
+// ハードクリップの代わりに滑らかに飽和させる (クリップ由来の高調波を防ぐ)
+function softClip(x) {
+  const T = 6000, M = 8191;
+  if (x > T) return T + (M - T) * Math.tanh((x - T) / (M - T));
+  if (x < -T) return -T - (M - T) * Math.tanh((-x - T) / (M - T));
+  return x;
+}
+
+// Catmull-Rom 3次補間 (b→c 間を t=0..1 で補間)
+function cubic(a, b, c, d, t) {
+  return 0.5 * ((2 * b) + (c - a) * t + (2 * a - 5 * b + 4 * c - d) * t * t + (3 * b - a - 3 * c + d) * t * t * t);
+}
+
+class Biquad {
+  constructor() {
+    this.b0 = 1; this.b1 = 0; this.b2 = 0; this.a1 = 0; this.a2 = 0;
+    this.z1 = 0; this.z2 = 0;
+  }
+  setLowpass(fs, fc, q) {
+    const w0 = 2 * Math.PI * fc / fs, cs = Math.cos(w0), al = Math.sin(w0) / (2 * q);
+    const a0 = 1 + al;
+    this.b0 = (1 - cs) / 2 / a0; this.b1 = (1 - cs) / a0; this.b2 = this.b0;
+    this.a1 = -2 * cs / a0; this.a2 = (1 - al) / a0;
+  }
+  setHighShelf(fs, fc, db) {
+    const A = Math.pow(10, db / 40), w0 = 2 * Math.PI * fc / fs;
+    const cs = Math.cos(w0), sn = Math.sin(w0);
+    const beta = 2 * Math.sqrt(A) * (sn / 2) * Math.SQRT2;      // S=1
+    const a0 = (A + 1) - (A - 1) * cs + beta;
+    this.b0 = A * ((A + 1) + (A - 1) * cs + beta) / a0;
+    this.b1 = -2 * A * ((A - 1) + (A + 1) * cs) / a0;
+    this.b2 = A * ((A + 1) + (A - 1) * cs - beta) / a0;
+    this.a1 = 2 * ((A - 1) - (A + 1) * cs) / a0;
+    this.a2 = ((A + 1) - (A - 1) * cs - beta) / a0;
+  }
+  process(x) {
+    const y = this.b0 * x + this.z1;
+    this.z1 = this.b1 * x - this.a1 * y + this.z2;
+    this.z2 = this.b2 * x - this.a2 * y;
+    return y;
+  }
+}
+
+// 8次バターワース・ローパス (+ 任意のハイシェルフ)
+const BUTTER8_Q = [1, 2, 3, 4].map(k => 1 / (2 * Math.sin(((2 * k - 1) * Math.PI) / 16)));
+class OutFilter {
+  constructor() {
+    this.s0 = new Biquad(); this.s1 = new Biquad(); this.s2 = new Biquad(); this.s3 = new Biquad();
+    this.shelf = new Biquad();
+    this.useShelf = false;
+  }
+  design(fs, fcLow, shelfHz, shelfDb) {
+    this.s0.setLowpass(fs, fcLow, BUTTER8_Q[3]);
+    this.s1.setLowpass(fs, fcLow, BUTTER8_Q[2]);
+    this.s2.setLowpass(fs, fcLow, BUTTER8_Q[1]);
+    this.s3.setLowpass(fs, fcLow, BUTTER8_Q[0]);
+    this.useShelf = !!shelfDb && shelfHz > 0 && shelfHz < fs / 2;
+    if (this.useShelf) this.shelf.setHighShelf(fs, shelfHz, shelfDb);
+  }
+  process(x) {
+    x = this.s3.process(this.s2.process(this.s1.process(this.s0.process(x))));
+    return this.useShelf ? this.shelf.process(x) : x;
+  }
+}
+
+// =====================================================================
 //  FM オペレータ
 // =====================================================================
 class FMOperator {
   constructor() {
     this.phase = 0;          // 20bit 位相カウンタ
     this.phaseInc = 0;
+    this.phaseStep = 0;      // オーバーサンプリング 1 ステップあたりの位相増分
     this.fnum = 0;
     this.block = 0;
     this.kc = 0;
@@ -279,15 +372,16 @@ class FMOperator {
 
   recalc() {
     let fn = this.fnum;
-    if (this.pmMul !== 1) fn = Math.round(fn * this.pmMul);
-    let inc = (fn << this.block) >> 1;
+    if (this.pmMul !== 1) fn *= this.pmMul;                 // ビブラートは丸めずに滑らかに
+    let inc = fn * (1 << this.block) * 0.5;
     const mag = this.det & 3;
     if (mag) {
       const d = DETUNE_TABLE[this.kc][mag];
       inc += (this.det & 4) ? -d : d;
     }
-    inc &= 0x1ffff;
-    this.phaseInc = (inc * this.mul2) >> 1;
+    if (inc < 0) inc = 0;
+    this.phaseInc = inc * this.mul2 * 0.5;                  // 小数精度のまま保持 (ピッチ誤差なし)
+    this.phaseStep = this.phaseInc / FM_OS;
   }
 
   _rate(state) {
@@ -377,20 +471,19 @@ class FMOperator {
     if (this.att < 0) this.att = 0;
   }
 
-  // 位相変調 mod を加えた出力 (±8191 程度)
+  // 位相変調 mod (1024 = 1周期) を加えた出力 (±8176 程度, 浮動小数点)
   calc(mod, am) {
-    const ph = ((this.phase >> 10) + mod) & 0x3ff;
-    let x = ph;
-    if (x & 0x100) x = ~x;
     let e = this.att;
     if ((this.ssg & 8) && this.ssgInv) e = (0x200 - e) & 0x3ff;
     if (this.am) e += am;
     e += this.tl << 3;
     if (e > 0x3ff) e = 0x3ff;
-    let inp = SIN_ATT[x & 0xff] + (e << 2);
-    if (inp > 0x1fff) inp = 0x1fff;
-    const v = ((POW_TAB[inp & 0xff] | 0x400) << 2) >> (inp >> 8);
-    return (ph & 0x200) ? -v : v;
+    const t = this.phase * (SIN_N / 1048576) + mod * (SIN_N / 1024) + 65536;
+    const i = t | 0;
+    const f = t - i;
+    const k = i & (SIN_N - 1);
+    const a = SIN_TAB[k];
+    return (a + (SIN_TAB[k + 1] - a) * f) * ENV_AMP[e];     // 位相を補間して量子化ノイズを排除
   }
 }
 
@@ -414,9 +507,18 @@ class FMChannel {
 
   render(lfoAm) {
     const o1 = this.ops[0], o2 = this.ops[1], o3 = this.ops[2], o4 = this.ops[3];
+
+    // 完全に消音しているチャンネルは計算を省略 (負荷軽減)
+    if (o1.att >= 0x3ff && o2.att >= 0x3ff && o3.att >= 0x3ff && o4.att >= 0x3ff &&
+        o1.state === EG_REL && o2.state === EG_REL && o3.state === EG_REL && o4.state === EG_REL &&
+        !((o1.ssg | o2.ssg | o3.ssg | o4.ssg) & 8)) {
+      this.fb0 = this.fb1 = 0;
+      return 0;
+    }
+
     const am = lfoAm >> AMS_SHIFT[this.ams];
 
-    const fbMod = this.feedback ? ((this.fb0 + this.fb1) >> (10 - this.feedback)) : 0;
+    const fbMod = this.feedback ? (this.fb0 + this.fb1) * FB_SCALE[this.feedback] : 0;
     const v1 = o1.calc(fbMod, am);
     this.fb0 = this.fb1;
     this.fb1 = v1;
@@ -424,37 +526,37 @@ class FMChannel {
     let out, v2, v3;
     switch (this.algorithm) {
       case 0:
-        v2 = o2.calc(v1 >> 1, am);
-        v3 = o3.calc(v2 >> 1, am);
-        out = o4.calc(v3 >> 1, am);
+        v2 = o2.calc(v1 * 0.5, am);
+        v3 = o3.calc(v2 * 0.5, am);
+        out = o4.calc(v3 * 0.5, am);
         break;
       case 1:
         v2 = o2.calc(0, am);
-        v3 = o3.calc((v1 + v2) >> 1, am);
-        out = o4.calc(v3 >> 1, am);
+        v3 = o3.calc((v1 + v2) * 0.5, am);
+        out = o4.calc(v3 * 0.5, am);
         break;
       case 2:
         v2 = o2.calc(0, am);
-        v3 = o3.calc(v2 >> 1, am);
-        out = o4.calc((v1 + v3) >> 1, am);
+        v3 = o3.calc(v2 * 0.5, am);
+        out = o4.calc((v1 + v3) * 0.5, am);
         break;
       case 3:
-        v2 = o2.calc(v1 >> 1, am);
+        v2 = o2.calc(v1 * 0.5, am);
         v3 = o3.calc(0, am);
-        out = o4.calc((v2 + v3) >> 1, am);
+        out = o4.calc((v2 + v3) * 0.5, am);
         break;
       case 4:
-        v2 = o2.calc(v1 >> 1, am);
+        v2 = o2.calc(v1 * 0.5, am);
         v3 = o3.calc(0, am);
-        out = v2 + o4.calc(v3 >> 1, am);
+        out = v2 + o4.calc(v3 * 0.5, am);
         break;
       case 5: {
-        const m = v1 >> 1;
+        const m = v1 * 0.5;
         out = o2.calc(m, am) + o3.calc(m, am) + o4.calc(m, am);
         break;
       }
       case 6:
-        v2 = o2.calc(v1 >> 1, am);
+        v2 = o2.calc(v1 * 0.5, am);
         out = v2 + o3.calc(0, am) + o4.calc(0, am);
         break;
       default:
@@ -462,13 +564,13 @@ class FMChannel {
         break;
     }
 
-    o1.phase = (o1.phase + o1.phaseInc) & 0xfffff;
-    o2.phase = (o2.phase + o2.phaseInc) & 0xfffff;
-    o3.phase = (o3.phase + o3.phaseInc) & 0xfffff;
-    o4.phase = (o4.phase + o4.phaseInc) & 0xfffff;
+    let p;
+    p = o1.phase + o1.phaseStep; o1.phase = p >= 1048576 ? p - 1048576 : p;
+    p = o2.phase + o2.phaseStep; o2.phase = p >= 1048576 ? p - 1048576 : p;
+    p = o3.phase + o3.phaseStep; o3.phase = p >= 1048576 ? p - 1048576 : p;
+    p = o4.phase + o4.phaseStep; o4.phase = p >= 1048576 ? p - 1048576 : p;
 
-    if (out > 8191) out = 8191;
-    else if (out < -8192) out = -8192;
+    if (out > 6000 || out < -6000) out = softClip(out);     // ハードクリップ → ソフトクリップ
     return out;
   }
 }
@@ -619,6 +721,7 @@ class YM2608Rhythm {
       this.ch.push({
         active: false, addr: 0, acc: 0, step: 0, out: 0, phase: 0,
         il: 0, left: true, right: true, mul: 0, shift: 0,
+        h0: 0, h1: 0, h2: 0, h3: 0,
       });
       this._updateLevel(i);
     }
@@ -646,6 +749,7 @@ class YM2608Rhythm {
             const c = this.ch[i];
             c.addr = YM2608_RHYTHM_ADDR[i][0] * 2;         // ニブル単位
             c.acc = 0; c.step = 0; c.out = 0; c.phase = 0;
+            c.h0 = c.h1 = c.h2 = c.h3 = 0;
             c.active = true;
           }
         }
@@ -673,7 +777,7 @@ class YM2608Rhythm {
     c.acc = (((c.acc + d) + 2048) & 0xfff) - 2048;         // 12bit 符号付きでラップ
     c.step += ADPCMA_STEP_INC[nib & 7];
     if (c.step < 0) c.step = 0; else if (c.step > 48) c.step = 48;
-    c.out = ((c.acc * c.mul) >> c.shift) & ~3;
+    c.out = (c.acc * c.mul) / (1 << c.shift);              // 下位ビットの切り捨てをしない
   }
 
   render() {
@@ -682,9 +786,13 @@ class YM2608Rhythm {
       const c = this.ch[i];
       if (!c.active) continue;
       c.phase += this.nibStep;
-      while (c.phase >= 1 && c.active) { c.phase -= 1; this._decode(c, i); }
-      // 出力は FM 1ch と同じスケールで (ADPCM-A 出力 >> 1) を加算
-      const s = (c.out * 1.5) * FM_GAIN;
+      while (c.phase >= 1 && c.active) {
+        c.phase -= 1;
+        this._decode(c, i);
+        c.h0 = c.h1; c.h1 = c.h2; c.h2 = c.h3; c.h3 = c.out;
+      }
+      // 約18.5kHzのサンプルを3次補間でアップサンプル (階段状の鏡像ノイズを抑える)
+      const s = cubic(c.h0, c.h1, c.h2, c.h3, c.phase) * 1.5 * FM_GAIN;
       if (c.left) sumL += s;
       if (c.right) sumR += s;
     }
@@ -714,6 +822,7 @@ class YM2608ADPCM {
     this.phase = 0;
     this.prev = 0;
     this.cur = 0;
+    this.h0 = this.h1 = this.h2 = this.h3 = 0;
   }
 
   loadRam(src) {
@@ -729,6 +838,7 @@ class YM2608ADPCM {
     this.step = 127;
     this.prev = 0;
     this.cur = 0;
+    this.h0 = this.h1 = this.h2 = this.h3 = 0;
     this.phase = 0;
   }
 
@@ -789,14 +899,14 @@ class YM2608ADPCM {
     this.phase += nibRate / this.outRate;
     while (this.phase >= 1) {
       this.phase -= 1;
-      this.prev = this.cur;
-      this.cur = this._decodeNibble();
+      this.h0 = this.h1; this.h1 = this.h2; this.h2 = this.h3;
+      this.h3 = this._decodeNibble();
       if (!this.playing) break;
     }
 
     const panReg = this.regs[0x01];
     const level = this.regs[0x0b];
-    const s = ((this.prev + (this.cur - this.prev) * this.phase) * level / 512) * FM_GAIN;
+    const s = (cubic(this.h0, this.h1, this.h2, this.h3, this.phase) * level / 512) * FM_GAIN;
     return [(panReg & 0x80) ? s : 0, (panReg & 0x40) ? s : 0];
   }
 }
@@ -804,8 +914,8 @@ class YM2608ADPCM {
 // =====================================================================
 //  OPN チップ本体 (YM2203 / YM2608 共通)
 // =====================================================================
-const FM_GAIN = 0.8 / 32768;     // FM 1ch 最大 ≒ 0.2
-const SSG_GAIN = 0.2;            // SSG 1ch 最大 ≒ 0.2
+const FM_GAIN = 1.8 / 32768;     // FM 1ch 最大 ≒ 0.2
+const SSG_GAIN = 0.3;            // SSG 1ch 最大 ≒ 0.2
 
 class OPNChip {
   constructor(type, outRate, clock) {
@@ -836,12 +946,21 @@ class OPNChip {
     this.lfoCnt = 0;
     this.lfoAm = 0;
 
+    // FM: ネイティブレート×FM_OS で合成 → ローパス → 出力レートへ補間
     this.fmL = 0; this.fmR = 0;
-    this.fmRemain = 0;
-    this.ssgVal = 0;
-    this.ssgRemain = 0;
+    this.osSub = 0;
+    this.fmAcc = 0;
+    this.fmPrevL = 0; this.fmPrevR = 0; this.fmCurL = 0; this.fmCurR = 0;
+    this.fmFiltL = new OutFilter();
+    this.fmFiltR = new OutFilter();
+    // SSG
+    this.ssgAcc = 0;
+    this.ssgPrev = 0; this.ssgCur = 0;
+    this.ssgFilt = new OutFilter();
 
+    this.dcCoef = Math.pow(0.9995, 44100 / outRate);
     this.dcL = 0; this.dcR = 0; this.prevL = 0; this.prevR = 0;
+    this._o = [0, 0];
 
     this._updateRates();
   }
@@ -862,10 +981,19 @@ class OPNChip {
     // SSG クロック = マスター×2/ssgPres (YM2203 既定で clock/2)、YM2608 はさらに 1/2 (既定で clock/4)。
     // 内部は SSG クロック/8 で 1 ステップ進む
     this.ssgRate = (this.clock * 2) / (this.is2608 ? ssgDiv * 2 : ssgDiv) / 8;
-    this.fmStep = this.fmRate / this.outRate;
+    this.fmHiStep = (this.fmRate * FM_OS) / this.outRate;   // 出力1サンプルあたりの FM 高レート生成数
     if (this.adpcm) this.adpcm.fmRate = this.fmRate;
     if (this.rhythm) this.rhythm.setFmRate(this.fmRate);
     this.ssgStep = this.ssgRate / this.outRate;
+    this._designFilters();
+  }
+
+  _designFilters() {
+    const nyq = this.outRate / 2;
+    const fmFs = this.fmRate * FM_OS;
+    this.fmFiltL.design(fmFs, Math.min(HQ.fmLowpassHz, nyq * 0.9), HQ.fmShelfHz, HQ.fmShelfDb);
+    this.fmFiltR.design(fmFs, Math.min(HQ.fmLowpassHz, nyq * 0.9), HQ.fmShelfHz, HQ.fmShelfDb);
+    this.ssgFilt.design(this.ssgRate, Math.min(HQ.ssgLowpassHz, nyq * 0.9), 0, 0);
   }
 
   // ---- レジスタ書き込み ----
@@ -1037,8 +1165,8 @@ class OPNChip {
     }
   }
 
-  // ---- FM 1 サンプル (ネイティブレート) ----
-  _genFM() {
+  // ---- ネイティブレート 1 サンプルごとの内部更新 (LFO / エンベロープ) ----
+  _nativeTick() {
     if (this.lfoOn) {
       if (++this.lfoSub >= LFO_PERIOD[this.lfoFreq]) {
         this.lfoSub = 0;
@@ -1057,10 +1185,17 @@ class OPNChip {
         for (const op of ch.ops) op.clockEnv(cnt);
       }
     }
+  }
+
+  // ---- FM 1 サンプル (ネイティブレート × FM_OS の高レート) ----
+  _genFMHi() {
+    if (++this.osSub >= FM_OS) { this.osSub = 0; this._nativeTick(); }
 
     let l = 0, r = 0;
     const am = this.lfoAm;
-    for (const ch of this.channels) {
+    const chs = this.channels;
+    for (let i = 0; i < chs.length; i++) {
+      const ch = chs[i];
       const s = ch.render(am);
       if (ch.panLeft) l += s;
       if (ch.panRight) r += s;
@@ -1071,29 +1206,27 @@ class OPNChip {
 
   // ---- 出力サンプル1つ分 (outRate) ----
   renderSample() {
-    // FM: ネイティブレート → 出力レートへ箱型平均でリサンプル
-    let need = this.fmStep, sl = 0, sr = 0;
-    while (need > 1e-9) {
-      if (this.fmRemain <= 1e-9) { this._genFM(); this.fmRemain = 1; }
-      const t = this.fmRemain < need ? this.fmRemain : need;
-      sl += this.fmL * t;
-      sr += this.fmR * t;
-      this.fmRemain -= t;
-      need -= t;
+    // FM
+    this.fmAcc += this.fmHiStep;
+    while (this.fmAcc >= 1) {
+      this.fmAcc -= 1;
+      this._genFMHi();
+      this.fmPrevL = this.fmCurL; this.fmPrevR = this.fmCurR;
+      this.fmCurL = this.fmFiltL.process(this.fmL);
+      this.fmCurR = this.fmFiltR.process(this.fmR);
     }
-    const fmL = sl / this.fmStep, fmR = sr / this.fmStep;
+    const ft = this.fmAcc;
+    const fmL = this.fmPrevL + (this.fmCurL - this.fmPrevL) * ft;
+    const fmR = this.fmPrevR + (this.fmCurR - this.fmPrevR) * ft;
 
-    // SSG
-    need = this.ssgStep;
-    let ss = 0;
-    while (need > 1e-9) {
-      if (this.ssgRemain <= 1e-9) { this.ssgVal = this.ssg.clock(); this.ssgRemain = 1; }
-      const t = this.ssgRemain < need ? this.ssgRemain : need;
-      ss += this.ssgVal * t;
-      this.ssgRemain -= t;
-      need -= t;
+    // SSG (高レートで合成 → ローパス → 補間)
+    this.ssgAcc += this.ssgStep;
+    while (this.ssgAcc >= 1) {
+      this.ssgAcc -= 1;
+      this.ssgPrev = this.ssgCur;
+      this.ssgCur = this.ssgFilt.process(this.ssg.clock());
     }
-    const ssgOut = (ss / this.ssgStep) * SSG_GAIN;
+    const ssgOut = (this.ssgPrev + (this.ssgCur - this.ssgPrev) * this.ssgAcc) * SSG_GAIN;
 
     let mixL = fmL * FM_GAIN + ssgOut;
     let mixR = fmR * FM_GAIN + ssgOut;
@@ -1106,12 +1239,15 @@ class OPNChip {
     }
 
     // カップリングコンデンサ相当の DC カット (SSG は単極性のため)
-    const oL = mixL - this.prevL + 0.9995 * this.dcL;
-    const oR = mixR - this.prevR + 0.9995 * this.dcR;
+    const k = this.dcCoef;
+    const oL = mixL - this.prevL + k * this.dcL;
+    const oR = mixR - this.prevR + k * this.dcR;
     this.prevL = mixL; this.prevR = mixR;
     this.dcL = oL; this.dcR = oR;
 
-    return [oL, oR];
+    const o = this._o;
+    o[0] = oL; o[1] = oR;
+    return o;
   }
 }
 
@@ -1141,16 +1277,15 @@ class VGMPlayer {
     this.loopEnabled = true;
     this.ended = false;
 
-    this.outAccumPos = 0;
-    this.prevL = 0; this.prevR = 0;
-    this.curL = 0; this.curR = 0;
+    this.outRate = audioCtx.sampleRate;                      // チップはデバイスレートで直接合成する
+    this.vgmPerOut = this.vgmRate / this.outRate;            // 出力1サンプルで進む VGM サンプル数
     this._posCounter = 0;
 
     this.onPosition = null;
     this.onEnded = null;
     this.onLooped = null;
 
-    this.node = this.audioCtx.createScriptProcessor(4096, 0, 2);
+    this.node = this.audioCtx.createScriptProcessor(8192, 0, 2);
     this.node.onaudioprocess = (e) => this._process(e);
   }
 
@@ -1159,11 +1294,9 @@ class VGMPlayer {
 
   _createChips() {
     const c = this.cfg;
-    this.chip2203 = c.ym2203Clock ? new OPNChip(2203, this.vgmRate, c.ym2203Clock) : null;
-    this.chip2608 = c.ym2608Clock ? new OPNChip(2608, this.vgmRate, c.ym2608Clock) : null;
+    this.chip2203 = c.ym2203Clock ? new OPNChip(2203, this.outRate, c.ym2203Clock) : null;
+    this.chip2608 = c.ym2608Clock ? new OPNChip(2608, this.outRate, c.ym2608Clock) : null;
     if (this.chip2608 && c.adpcmRam) this.chip2608.setAdpcmRam(c.adpcmRam);
-    this.prevL = this.prevR = this.curL = this.curR = 0;
-    this.outAccumPos = 0;
   }
 
   load(vgmParser) {
@@ -1225,7 +1358,8 @@ class VGMPlayer {
     return [l, r];
   }
 
-  _advanceOneVgmSample() {
+  // 出力 1 サンプル分: 到達したイベントを反映 → チップ合成 → 時間を進める
+  _renderOneOut() {
     while (this.eventIndex < this.events.length && this.events[this.eventIndex].sampleOffset <= this.currentSample) {
       const ev = this.events[this.eventIndex];
       if (ev.type === 'end') {
@@ -1240,20 +1374,19 @@ class VGMPlayer {
         this.ended = true;
         this.playing = false;
         if (this.onEnded) this.onEnded();
-        break;
+        return null;
       }
       this._dispatch(ev);
       this.eventIndex++;
     }
     const sample = this._renderChips();
-    this.currentSample++;
+    this.currentSample += this.vgmPerOut;
     return sample;
   }
 
   _process(e) {
     const left = e.outputBuffer.getChannelData(0);
     const right = e.outputBuffer.getChannelData(1);
-    const ratio = this.vgmRate / this.audioCtx.sampleRate;
 
     for (let i = 0; i < left.length; i++) {
       if (!this.playing || this.ended) {
@@ -1261,34 +1394,28 @@ class VGMPlayer {
         right[i] = 0;
         continue;
       }
-
-      // VGM レート(44.1kHz) → デバイスレートを線形補間で変換
-      this.outAccumPos += ratio;
-      while (this.outAccumPos >= 1) {
-        this.prevL = this.curL;
-        this.prevR = this.curR;
-        const res = this._advanceOneVgmSample();
-        this.curL = res[0];
-        this.curR = res[1];
-        this.outAccumPos -= 1;
-        if (this.ended) break;
-      }
-      const t = this.outAccumPos;
-      const sL = this.prevL + (this.curL - this.prevL) * t;
-      const sR = this.prevR + (this.curR - this.prevR) * t;
-
-      left[i] = sL > 1 ? 1 : sL < -1 ? -1 : sL;
-      right[i] = sR > 1 ? 1 : sR < -1 ? -1 : sR;
+      const s = this._renderOneOut();
+      if (!s) { left[i] = 0; right[i] = 0; continue; }
+      left[i] = softOut(s[0]);
+      right[i] = softOut(s[1]);
     }
 
     this._posCounter += left.length;
     if (this._posCounter > 4096) {
       this._posCounter = 0;
       if (this.onPosition) {
-        this.onPosition({ sample: this.currentSample, total: this.totalSamples });
+        this.onPosition({ sample: Math.floor(this.currentSample), total: this.totalSamples });
       }
     }
   }
+}
+
+// 出力のハードクリップを避ける (0.85 以上を滑らかに飽和)
+function softOut(x) {
+  const T = 0.85;
+  if (x > T) return T + (1 - T) * Math.tanh((x - T) / (1 - T));
+  if (x < -T) return -T - (1 - T) * Math.tanh((-x - T) / (1 - T));
+  return x;
 }
 
 if (typeof module !== 'undefined') {
@@ -1446,7 +1573,7 @@ function populateMeta(parser, filename) {
 async function ensureAudio() {
   if (state.audioCtx) return;
   const Ctx = window.AudioContext || window.webkitAudioContext;
-  const ctx = new Ctx();
+  const ctx = new Ctx({ latencyHint: 'playback' });
   
 
   const gain = ctx.createGain();
