@@ -15,7 +15,1292 @@
 
 <h1>OPN Web</h1>
     <input type="file" id="fileInput" accept=".vgm,.vgz">
-<script src="opn.js"></script>
+<script>
+  'use strict';
+
+// =====================================================================
+//  VGM パーサ
+// =====================================================================
+class VGMParser {
+  constructor(arrayBuffer) {
+    this.buf = new Uint8Array(arrayBuffer);
+    this.view = new DataView(arrayBuffer);
+    this.header = {};
+    this.gd3 = null;
+    this.events = []; // { sampleOffset, type, ...data }
+    this.totalSamples = 0;
+    this.loopSampleOffset = -1;
+    this.adpcmRam = null;
+    this._parse();
+  }
+
+  _readU32(off) { return this.view.getUint32(off, true); }
+  _readU16(off) { return this.view.getUint16(off, true); }
+
+  _magic(off) {
+    return String.fromCharCode(this.buf[off], this.buf[off + 1], this.buf[off + 2], this.buf[off + 3]);
+  }
+
+  _parse() {
+    if (this._magic(0) !== 'Vgm ') {
+      throw new Error('VGMファイルではありません (シグネチャ不一致)');
+    }
+    const h = this.header;
+    h.eofOffset = this._readU32(0x04);
+    h.version = this._readU32(0x08);
+    h.gd3Offset = this._readU32(0x14);
+    h.totalSamples = this._readU32(0x18);
+    h.loopOffset = this._readU32(0x1c);
+    h.loopSamples = this._readU32(0x20);
+
+    h.ym2203Clock = 0;
+    h.ym2608Clock = 0;
+    h.dataOffset = 0x40;
+
+    if (h.version >= 0x150) {
+      const dataOff = this._readU32(0x34);
+      h.dataOffset = dataOff !== 0 ? dataOff + 0x34 : 0x40;
+    }
+    if (h.version >= 0x151 && h.dataOffset >= 0x4c && this.buf.length >= 0x4c) {
+      // bit30 はデュアルチップ指定なのでマスクする
+      h.ym2203Clock = this._readU32(0x44) & 0x3fffffff;
+      h.ym2608Clock = this._readU32(0x48) & 0x3fffffff;
+    }
+
+    this.totalSamples = h.totalSamples;
+    this.loopByteOffset = h.loopOffset ? h.loopOffset + 0x1c : -1;
+
+    if (h.gd3Offset) {
+      this._parseGD3(h.gd3Offset + 0x14);
+    }
+
+    this._parseCommands();
+  }
+
+  _parseGD3(off) {
+    try {
+      if (this._magic(off) !== 'Gd3 ') return;
+      let p = off + 12;
+      const strs = [];
+      let cur = [];
+      while (p < this.buf.length - 1) {
+        const code = this._readU16(p);
+        p += 2;
+        if (code === 0) {
+          strs.push(cur.join(''));
+          cur = [];
+          if (strs.length >= 11) break;
+        } else {
+          cur.push(String.fromCharCode(code));
+        }
+      }
+      this.gd3 = {
+        trackNameEn: strs[0] || '',
+        trackNameJp: strs[1] || '',
+        gameNameEn: strs[2] || '',
+        gameNameJp: strs[3] || '',
+        systemNameEn: strs[4] || '',
+        systemNameJp: strs[5] || '',
+        authorEn: strs[6] || '',
+        authorJp: strs[7] || '',
+        releaseDate: strs[8] || '',
+        vgmBy: strs[9] || '',
+        notes: strs[10] || '',
+      };
+    } catch (e) {
+      this.gd3 = null;
+    }
+  }
+
+  _parseCommands() {
+    const buf = this.buf;
+    let p = this.header.dataOffset;
+    const end = this.header.gd3Offset ? Math.min(buf.length, this.header.gd3Offset + 0x14) : buf.length;
+    let sampleOffset = 0;
+    const loopStartByte = this.loopByteOffset;
+
+    while (p < end && p < buf.length) {
+      const cmd = buf[p];
+
+      if (loopStartByte >= 0 && p === loopStartByte) {
+        this.loopSampleOffset = sampleOffset;
+      }
+
+      if (cmd === 0x66) {
+        this.events.push({ sampleOffset, type: 'end' });
+        break;
+      } else if (cmd === 0x55) {                         // YM2203
+        this.events.push({ sampleOffset, type: 'ym2203', addr: buf[p + 1], data: buf[p + 2] });
+        p += 3;
+      } else if (cmd === 0x56 || cmd === 0x57) {         // YM2608 port0 / port1
+        this.events.push({ sampleOffset, type: 'ym2608', port: cmd === 0x57 ? 1 : 0, addr: buf[p + 1], data: buf[p + 2] });
+        p += 3;
+      } else if (cmd === 0x61) {
+        sampleOffset += this._readU16(p + 1);
+        p += 3;
+      } else if (cmd === 0x62) {
+        sampleOffset += 735;
+        p += 1;
+      } else if (cmd === 0x63) {
+        sampleOffset += 882;
+        p += 1;
+      } else if (cmd >= 0x70 && cmd <= 0x7f) {
+        sampleOffset += (cmd & 0x0f) + 1;
+        p += 1;
+      } else if (cmd >= 0x80 && cmd <= 0x8f) {
+        sampleOffset += (cmd & 0x0f);
+        p += 1;
+      } else if (cmd === 0x67) {                         // data block
+        const dataType = buf[p + 2];
+        const size = this._readU32(p + 3);
+        if (dataType === 0x81) {
+          // YM2608 DELTA-T ROM: [全体サイズ(4)] [開始アドレス(4)] [データ...]
+          const romSize = this._readU32(p + 7);
+          const startAddr = this._readU32(p + 11);
+          const data = buf.subarray(p + 15, p + 7 + size);
+          if (!this.adpcmRam) this.adpcmRam = new Uint8Array(Math.max(256 * 1024, Math.min(romSize, 16 * 1024 * 1024)));
+          if (startAddr < this.adpcmRam.length) {
+            this.adpcmRam.set(data.subarray(0, this.adpcmRam.length - startAddr), startAddr);
+          }
+        }
+        p += 7 + size;
+      } else if (cmd === 0x68) {
+        p += 12;
+      } else if (cmd === 0x64) {
+        p += 4;
+      } else if ((cmd >= 0x30 && cmd <= 0x3f) || cmd === 0x4f || cmd === 0x50) {
+        p += 2;
+      } else if ((cmd >= 0x40 && cmd <= 0x4e) || (cmd >= 0x51 && cmd <= 0x5f) || (cmd >= 0xa0 && cmd <= 0xbf)) {
+        p += 3;                                          // 他チップ(YM2612等)のコマンドは読み飛ばす
+      } else if (cmd >= 0x90 && cmd <= 0x95) {
+        if (cmd === 0x90 || cmd === 0x91 || cmd === 0x95) p += 5;
+        else if (cmd === 0x92) p += 6;
+        else if (cmd === 0x93) p += 11;
+        else p += 2;
+      } else if (cmd >= 0xc0 && cmd <= 0xdf) {
+        p += 4;
+      } else if (cmd >= 0xe0) {
+        p += 5;
+      } else {
+        p += 1;                                          // 未知コマンド(予約領域)は1バイト進める
+      }
+    }
+
+    if (this.events.length === 0 || this.events[this.events.length - 1].type !== 'end') {
+      this.events.push({ sampleOffset, type: 'end' });
+    }
+  }
+}
+
+// =====================================================================
+//  OPN 共通テーブル
+// =====================================================================
+
+// デチューン (キーコード 0~31 × DT1 の強度 0~3) 実機値
+const DETUNE_TABLE = (() => {
+  const c1 = [0,0,0,0,1,1,1,1,1,1,1,1,2,2,2,2,2,3,3,3,4,4,4,5,5,6,6,7,8,8,8,8];
+  const c2 = [1,1,1,1,2,2,2,2,2,3,3,3,4,4,4,5,5,6,6,7,8,8,9,10,11,12,13,14,16,16,16,16];
+  const c3 = [2,2,2,2,2,3,3,3,4,4,4,5,5,6,6,7,8,8,9,10,11,12,13,14,16,17,19,20,22,22,22,22];
+  const t = [];
+  for (let k = 0; k < 32; k++) t.push([0, c1[k], c2[k], c3[k]]);
+  return t;
+})();
+
+// 対数サイン表 / 指数表 (実機と同じ 8.8 固定小数点の減衰量で計算する)
+const SIN_ATT = new Uint16Array(256);
+const POW_TAB = new Uint16Array(256);
+for (let i = 0; i < 256; i++) {
+  SIN_ATT[i] = Math.round(-Math.log2(Math.sin(((2 * i + 1) * Math.PI) / 1024)) * 256);
+  POW_TAB[i] = Math.round((Math.pow(2, (255 - i) / 256) - 1) * 1024);
+}
+
+// エンベロープ増分テーブル (レート 0~63、8ステップ分を4bitずつ)
+const EG_INC = (() => {
+  const t = [
+    0x00000000, 0x00000000, 0x10101010, 0x10101010,
+    0x10101010, 0x10101010, 0x11101110, 0x11101110,
+  ];
+  for (let i = 0; i < 10; i++) t.push(0x10101010, 0x10111010, 0x11101110, 0x11111110);
+  t.push(0x11111111, 0x21112111, 0x21212121, 0x22212221);
+  t.push(0x22222222, 0x42224222, 0x42424242, 0x44424442);
+  t.push(0x44444444, 0x84448444, 0x84848484, 0x88848884);
+  t.push(0x88888888, 0x88888888, 0x88888888, 0x88888888);
+  return new Uint32Array(t);
+})();
+
+const EG_ATT = 0, EG_DEC = 1, EG_SUS = 2, EG_REL = 3;
+const AMS_SHIFT = [8, 3, 1, 0];
+const LFO_PERIOD = [109, 78, 72, 68, 63, 45, 9, 6];          // LFO 1ステップあたりのFMサンプル数
+const PMS_CENTS = [0, 3.4, 6.7, 10, 14, 20, 40, 80];
+const OP_ORDER = [0, 2, 1, 3];                                // レジスタ上のスロット順 S1,S3,S2,S4 → op1..op4
+
+// =====================================================================
+//  FM オペレータ
+// =====================================================================
+class FMOperator {
+  constructor() {
+    this.phase = 0;          // 20bit 位相カウンタ
+    this.phaseInc = 0;
+    this.fnum = 0;
+    this.block = 0;
+    this.kc = 0;
+    this.ksr = 0;
+    this.pmMul = 1;
+    this.mul2 = 1;           // MULTIPLE×2 (MUL=0 は 0.5倍 → 1)
+    this.det = 0;
+    this.tl = 127;
+    this.ks = 0;
+    this.ar = 0;
+    this.dr = 0;
+    this.sr = 0;
+    this.rr = 15;
+    this.sl = 0;
+    this.am = 0;
+    this.ssg = 0;
+    this.ssgInv = false;
+    this.state = EG_REL;
+    this.att = 0x3ff;        // 10bit 減衰量 (0=最大音量)
+    this.keyOn = false;
+  }
+
+  setFreq(fnum, block) {
+    this.fnum = fnum;
+    this.block = block;
+    const f11 = (fnum >> 10) & 1, f10 = (fnum >> 9) & 1, f9 = (fnum >> 8) & 1, f8 = (fnum >> 7) & 1;
+    const n3 = f11 ? (f10 | f9 | f8) : (f10 & f9 & f8);
+    this.kc = (block << 2) | (f11 << 1) | n3;
+    this.updateKsr();
+  }
+
+  updateKsr() {
+    this.ksr = this.kc >> (3 - this.ks);
+    this.recalc();
+  }
+
+  recalc() {
+    let fn = this.fnum;
+    if (this.pmMul !== 1) fn = Math.round(fn * this.pmMul);
+    let inc = (fn << this.block) >> 1;
+    const mag = this.det & 3;
+    if (mag) {
+      const d = DETUNE_TABLE[this.kc][mag];
+      inc += (this.det & 4) ? -d : d;
+    }
+    if (inc < 0) inc &= 0x1ffff;
+    else if (inc > 0x1ffff) inc = 0x1ffff;
+    this.phaseInc = (inc * this.mul2) >> 1;
+  }
+
+  _rate(state) {
+    let base;
+    switch (state) {
+      case EG_ATT: base = this.ar * 2; break;
+      case EG_DEC: base = this.dr * 2; break;
+      case EG_SUS: base = this.sr * 2; break;
+      default: base = this.rr * 4 + 2; break;
+    }
+    if (base === 0) return 0;
+    const r = base + this.ksr;
+    return r > 63 ? 63 : r;
+  }
+
+  setKey(on) {
+    if (on === this.keyOn) return;
+    this.keyOn = on;
+    if (on) {
+      this.phase = 0;
+      this.state = EG_ATT;
+      this.ssgInv = (this.ssg & 8) !== 0 && (this.ssg & 4) !== 0;
+      if (this._rate(EG_ATT) >= 62) {
+        this.att = 0;
+        this.state = EG_DEC;
+      }
+    } else if (this.state !== EG_REL) {
+      this.state = EG_REL;
+      if ((this.ssg & 8) && this.ssgInv) {
+        this.att = (0x200 - this.att) & 0x3ff;
+      }
+      this.ssgInv = false;
+    }
+  }
+
+  _clockSsg() {
+    if (!(this.ssg & 8) || this.att < 0x200) return;
+    const mode = this.ssg & 7;
+    if (mode & 1) {                                   // HOLD
+      this.ssgInv = (((mode >> 2) ^ (mode >> 1)) & 1) === 1;
+      if (this.state !== EG_ATT) this.att = this.ssgInv ? 0x200 : 0x3ff;
+    } else {                                          // LOOP
+      if (mode & 2) this.ssgInv = !this.ssgInv;
+      else this.phase = 0;
+      if (this.state !== EG_ATT) {
+        if (this._rate(EG_ATT) < 62) {
+          this.state = EG_ATT;
+        } else {
+          this.att = 0;
+          this.state = EG_DEC;
+        }
+      }
+    }
+  }
+
+  // エンベロープ 1 クロック (FM 3サンプルに1回呼ばれる)
+  clockEnv(cnt) {
+    if (this.state < EG_REL) this._clockSsg();
+
+    if (this.state === EG_ATT && this.att === 0) this.state = EG_DEC;
+    if (this.state === EG_DEC) {
+      const sl = this.sl === 15 ? 0x3e0 : (this.sl << 5);
+      if (this.att >= sl) this.state = EG_SUS;
+    }
+
+    const rate = this._rate(this.state);
+    if (rate === 0) return;
+    const sh = rate >> 2;
+    let idx;
+    if (sh <= 11) {
+      const s = 11 - sh;
+      if (cnt & ((1 << s) - 1)) return;
+      idx = (cnt >> s) & 7;
+    } else {
+      idx = cnt & 7;
+    }
+    const inc = (EG_INC[rate] >>> (idx * 4)) & 15;
+    if (inc === 0) return;
+
+    if (this.state === EG_ATT) {
+      if (rate < 62) this.att += ((~this.att) * inc) >> 4;
+    } else {
+      if (!(this.ssg & 8)) this.att += inc;
+      else if (this.att < 0x200) this.att += 4 * inc;
+      if (this.att >= 0x400) this.att = 0x3ff;
+    }
+    if (this.att < 0) this.att = 0;
+  }
+
+  // 位相変調 mod を加えた出力 (±8191 程度)
+  calc(mod, am) {
+    const ph = ((this.phase >> 10) + mod) & 0x3ff;
+    let x = ph;
+    if (x & 0x100) x = ~x;
+    let e = this.att;
+    if ((this.ssg & 8) && this.ssgInv) e = (0x200 - e) & 0x3ff;
+    if (this.am) e += am;
+    e += this.tl << 3;
+    if (e > 0x3ff) e = 0x3ff;
+    let inp = SIN_ATT[x & 0xff] + (e << 2);
+    if (inp > 0x1fff) inp = 0x1fff;
+    const v = ((POW_TAB[inp & 0xff] | 0x400) << 2) >> (inp >> 8);
+    return (ph & 0x200) ? -v : v;
+  }
+}
+
+// =====================================================================
+//  FM チャンネル
+// =====================================================================
+class FMChannel {
+  constructor() {
+    this.ops = [new FMOperator(), new FMOperator(), new FMOperator(), new FMOperator()];
+    this.algorithm = 0;
+    this.feedback = 0;
+    this.fnum = 0;
+    this.block = 0;
+    this.ams = 0;
+    this.pms = 0;
+    this.panLeft = true;
+    this.panRight = true;
+    this.fb0 = 0;
+    this.fb1 = 0;
+  }
+
+  render(lfoAm) {
+    const o1 = this.ops[0], o2 = this.ops[1], o3 = this.ops[2], o4 = this.ops[3];
+    const am = lfoAm >> AMS_SHIFT[this.ams];
+
+    const fbMod = this.feedback ? ((this.fb0 + this.fb1) >> (10 - this.feedback)) : 0;
+    const v1 = o1.calc(fbMod, am);
+    this.fb0 = this.fb1;
+    this.fb1 = v1;
+
+    let out, v2, v3;
+    switch (this.algorithm) {
+      case 0:
+        v2 = o2.calc(v1 >> 1, am);
+        v3 = o3.calc(v2 >> 1, am);
+        out = o4.calc(v3 >> 1, am);
+        break;
+      case 1:
+        v2 = o2.calc(0, am);
+        v3 = o3.calc((v1 + v2) >> 1, am);
+        out = o4.calc(v3 >> 1, am);
+        break;
+      case 2:
+        v2 = o2.calc(0, am);
+        v3 = o3.calc(v2 >> 1, am);
+        out = o4.calc((v1 + v3) >> 1, am);
+        break;
+      case 3:
+        v2 = o2.calc(v1 >> 1, am);
+        v3 = o3.calc(0, am);
+        out = o4.calc((v2 + v3) >> 1, am);
+        break;
+      case 4:
+        v2 = o2.calc(v1 >> 1, am);
+        v3 = o3.calc(0, am);
+        out = v2 + o4.calc(v3 >> 1, am);
+        break;
+      case 5: {
+        const m = v1 >> 1;
+        out = o2.calc(m, am) + o3.calc(m, am) + o4.calc(m, am);
+        break;
+      }
+      case 6:
+        v2 = o2.calc(v1 >> 1, am);
+        out = v2 + o3.calc(0, am) + o4.calc(0, am);
+        break;
+      default:
+        out = v1 + o2.calc(0, am) + o3.calc(0, am) + o4.calc(0, am);
+        break;
+    }
+
+    o1.phase = (o1.phase + o1.phaseInc) & 0xfffff;
+    o2.phase = (o2.phase + o2.phaseInc) & 0xfffff;
+    o3.phase = (o3.phase + o3.phaseInc) & 0xfffff;
+    o4.phase = (o4.phase + o4.phaseInc) & 0xfffff;
+
+    if (out > 8191) out = 8191;
+    else if (out < -8192) out = -8192;
+    return out;
+  }
+}
+
+// =====================================================================
+//  SSG (YM2149 互換)
+// =====================================================================
+const SSG_LEVELS = (() => {
+  const t = new Float64Array(32);
+  for (let i = 1; i < 32; i++) t[i] = Math.pow(2, -(31 - i) / 4);   // 1.5dB ステップ
+  return t;
+})();
+
+class SSG {
+  constructor() {
+    this.regs = new Uint8Array(16);
+    this.toneCnt = [0, 0, 0];
+    this.tonePos = [0, 0, 0];
+    this.noiseCnt = 0;
+    this.noiseShift = 1;
+    this.envCnt = 0;
+    this.envLevel = 0;
+    this.envDir = 1;
+    this.envHold = true;
+  }
+
+  write(addr, v) {
+    if (addr > 15) return;
+    switch (addr) {
+      case 1: case 3: case 5: v &= 0x0f; break;
+      case 6: v &= 0x1f; break;
+      case 8: case 9: case 10: v &= 0x1f; break;
+      case 13: v &= 0x0f; break;
+    }
+    this.regs[addr] = v;
+    if (addr === 13) this._envRestart();
+  }
+
+  _envRestart() {
+    const shape = this.regs[13];
+    this.envDir = (shape & 4) ? 1 : -1;
+    this.envLevel = (shape & 4) ? 0 : 31;
+    this.envHold = false;
+    this.envCnt = 0;
+  }
+
+  _envStep() {
+    const shape = this.regs[13];
+    let lvl = this.envLevel + this.envDir;
+    if (lvl < 0 || lvl > 31) {
+      const endVal = this.envDir > 0 ? 31 : 0;
+      if (!(shape & 8)) {
+        lvl = 0;
+        this.envHold = true;
+      } else if (shape & 1) {
+        lvl = (shape & 2) ? (31 - endVal) : endVal;
+        this.envHold = true;
+      } else if (shape & 2) {
+        this.envDir = -this.envDir;
+        lvl = endVal + this.envDir;
+      } else {
+        lvl = (shape & 4) ? 0 : 31;
+      }
+    }
+    this.envLevel = lvl;
+  }
+
+  // SSG 内部クロック(ssgClock/8)で 1 サンプル進めて 3ch 合計(0~3)を返す
+  clock() {
+    const r = this.regs;
+    for (let ch = 0; ch < 3; ch++) {
+      let p = r[ch * 2] | (r[ch * 2 + 1] << 8);
+      if (p === 0) p = 1;
+      if (++this.toneCnt[ch] >= p) {
+        this.toneCnt[ch] = 0;
+        this.tonePos[ch] ^= 1;
+      }
+    }
+
+    let np = r[6];
+    if (np === 0) np = 1;
+    if (++this.noiseCnt >= np * 2) {
+      this.noiseCnt = 0;
+      const bit = (this.noiseShift ^ (this.noiseShift >> 3)) & 1;
+      this.noiseShift = (this.noiseShift >> 1) | (bit << 16);
+    }
+    const noiseOut = this.noiseShift & 1;
+
+    let ep = r[11] | (r[12] << 8);
+    if (ep === 0) ep = 1;
+    if (++this.envCnt >= ep) {
+      this.envCnt = 0;
+      if (!this.envHold) this._envStep();
+    }
+
+    const mixer = r[7];
+    let sum = 0;
+    for (let ch = 0; ch < 3; ch++) {
+      const toneOut = ((mixer >> ch) & 1) | this.tonePos[ch];
+      const nOut = ((mixer >> (ch + 3)) & 1) | noiseOut;
+      if (toneOut & nOut) {
+        const v = r[8 + ch];
+        let idx;
+        if (v & 0x10) idx = this.envLevel;
+        else {
+          const a = v & 0x0f;
+          idx = a ? (a * 2 + 1) : 0;
+        }
+        sum += SSG_LEVELS[idx];
+      }
+    }
+    return sum;
+  }
+}
+
+// =====================================================================
+//  YM2608 リズム音源 (実機内蔵ROMは無いため近似波形)
+// =====================================================================
+class YM2608Rhythm {
+  constructor(sampleRate) {
+    this.sampleRate = sampleRate;
+    this.regs = new Uint8Array(0x20);
+    this.regs[0x11] = 0x3f;
+    for (let i = 0; i < 6; i++) this.regs[0x18 + i] = 0xdf;
+    this.buffers = [];
+    this.positions = [0, 0, 0, 0, 0, 0];
+    this.active = [false, false, false, false, false, false];
+    this._generateSamples();
+  }
+
+  _generateSamples() {
+    const sr = 16000;
+    let seed = 12345;
+    const rnd = () => { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return (seed / 0x3fffffff) - 1; };
+
+    const bdLen = Math.floor(sr * 0.18);
+    const bd = new Float32Array(bdLen);
+    let ph = 0;
+    for (let i = 0; i < bdLen; i++) {
+      const t = i / sr;
+      ph += ((140 * Math.exp(-t * 30) + 35) / sr) * Math.PI * 2;
+      bd[i] = Math.sin(ph) * Math.exp(-t * 22) * 1.2;
+    }
+    this.buffers.push(bd);
+
+    const sdLen = Math.floor(sr * 0.18);
+    const sd = new Float32Array(sdLen);
+    ph = 0;
+    for (let i = 0; i < sdLen; i++) {
+      const t = i / sr;
+      ph += ((220 * Math.exp(-t * 25) + 80) / sr) * Math.PI * 2;
+      sd[i] = Math.sin(ph) * Math.exp(-t * 28) * 0.5 + rnd() * Math.exp(-t * 18) * 0.7;
+    }
+    this.buffers.push(sd);
+
+    const tcLen = Math.floor(sr * 0.4);
+    const tc = new Float32Array(tcLen);
+    for (let i = 0; i < tcLen; i++) {
+      const t = i / sr;
+      const n1 = Math.sin(i * 3.14) > 0 ? 1 : -1;
+      const n2 = Math.sin(i * 4.37) > 0 ? 1 : -1;
+      const n3 = Math.sin(i * 5.82) > 0 ? 1 : -1;
+      tc[i] = (n1 + n2 + n3 + rnd()) * 0.25 * Math.exp(-t * 7);
+    }
+    this.buffers.push(tc);
+
+    const hhLen = Math.floor(sr * 0.06);
+    const hh = new Float32Array(hhLen);
+    let prevN = 0;
+    for (let i = 0; i < hhLen; i++) {
+      const t = i / sr;
+      const raw = rnd();
+      hh[i] = (raw - prevN * 0.6) * Math.exp(-t * 55) * 0.8;
+      prevN = raw;
+    }
+    this.buffers.push(hh);
+
+    const tomLen = Math.floor(sr * 0.16);
+    const tom = new Float32Array(tomLen);
+    ph = 0;
+    for (let i = 0; i < tomLen; i++) {
+      const t = i / sr;
+      ph += ((180 * Math.exp(-t * 20) + 60) / sr) * Math.PI * 2;
+      tom[i] = Math.sin(ph) * Math.exp(-t * 18) * 1.1;
+    }
+    this.buffers.push(tom);
+
+    const rimLen = Math.floor(sr * 0.05);
+    const rim = new Float32Array(rimLen);
+    ph = 0;
+    for (let i = 0; i < rimLen; i++) {
+      const t = i / sr;
+      ph += (850 / sr) * Math.PI * 2;
+      const click = i < 10 ? rnd() : 0;
+      rim[i] = (Math.sin(ph) * 0.6 + click * 0.8) * Math.exp(-t * 80);
+    }
+    this.buffers.push(rim);
+  }
+
+  write(addr, data) {
+    if (addr < 0x20) this.regs[addr] = data;
+    if (addr === 0x10) {
+      if (data & 0x80) {                                   // DUMP
+        for (let i = 0; i < 6; i++) this.active[i] = false;
+      } else {
+        for (let i = 0; i < 6; i++) {
+          if (data & (1 << i)) {
+            this.positions[i] = 0;
+            this.active[i] = true;
+          }
+        }
+      }
+    }
+  }
+
+  render() {
+    const total = this.regs[0x11] & 0x3f;
+    let sumL = 0, sumR = 0;
+    const stepRatio = 16000 / this.sampleRate;
+
+    for (let i = 0; i < 6; i++) {
+      if (!this.active[i]) continue;
+      const buf = this.buffers[i];
+      const pos = Math.floor(this.positions[i]);
+      if (pos >= buf.length) { this.active[i] = false; continue; }
+      this.positions[i] += stepRatio;
+
+      const instReg = this.regs[0x18 + i];
+      // トータルレベル/楽器レベルとも 0.75dB ステップ (値が大きいほど大音量)
+      const atten = ((63 - total) + (31 - (instReg & 0x1f))) * 0.75;
+      const s = buf[pos] * Math.pow(10, -atten / 20) * 0.4;
+      if (instReg & 0x80) sumL += s;
+      if (instReg & 0x40) sumR += s;
+    }
+    return [sumL, sumR];
+  }
+}
+
+// =====================================================================
+//  YM2608 ADPCM-B (DELTA-T)
+// =====================================================================
+const DELTAT_STEP_SCALE = [57, 57, 57, 57, 77, 102, 128, 153];
+
+class YM2608ADPCM {
+  constructor(outRate, clock) {
+    this.outRate = outRate;
+    this.clock = clock;
+    this.ram = new Uint8Array(256 * 1024);
+    this.regs = new Uint8Array(0x20);
+    this.regs[0x01] = 0xc0;
+
+    this.playing = false;
+    this.writePtr = 0;
+    this.nibblePos = 0;
+    this.acc = 0;
+    this.step = 127;
+    this.phase = 0;
+    this.prev = 0;
+    this.cur = 0;
+  }
+
+  loadRam(src) {
+    if (!src) return;
+    this.ram.set(src.subarray(0, this.ram.length));
+  }
+
+  _start() { return ((this.regs[3] << 8) | this.regs[2]) << 5; }
+  _end() { return (((this.regs[5] << 8) | this.regs[4]) << 5) | 0x1f; }
+
+  _resetDecoder() {
+    this.acc = 0;
+    this.step = 127;
+    this.prev = 0;
+    this.cur = 0;
+    this.phase = 0;
+  }
+
+  write(addr, data) {
+    if (addr < 0x20) this.regs[addr] = data;
+    if (addr === 0x00) {
+      if (data & 0x01) {                                   // RESET
+        this.playing = false;
+      }
+      if ((data & 0x60) === 0x60) {                        // メモリ書き込みモード
+        this.writePtr = this._start();
+      } else if ((data & 0x80) && !(data & 0x40)) {        // START (再生)
+        this.nibblePos = this._start() * 2;
+        this._resetDecoder();
+        this.playing = true;
+      }
+    } else if (addr === 0x08) {                            // CPU からの ADPCM RAM 書き込み
+      if ((this.regs[0x00] & 0x60) === 0x60) {
+        if (this.writePtr < this.ram.length) this.ram[this.writePtr] = data;
+        this.writePtr++;
+      }
+    }
+  }
+
+  _decodeNibble() {
+    const byteAddr = this.nibblePos >> 1;
+    if (byteAddr > this._end() || byteAddr >= this.ram.length) {
+      if (this.regs[0x00] & 0x10) {                        // REPEAT
+        this.nibblePos = this._start() * 2;
+        this.acc = 0;
+        this.step = 127;
+      } else {
+        this.playing = false;
+        return this.acc;
+      }
+    }
+    const b = this.ram[this.nibblePos >> 1];
+    const nib = (this.nibblePos & 1) ? (b & 0x0f) : (b >> 4);
+    this.nibblePos++;
+
+    let delta = (((nib & 7) * 2 + 1) * this.step) >> 3;
+    if (nib & 8) delta = -delta;
+    this.acc += delta;
+    if (this.acc > 32767) this.acc = 32767;
+    if (this.acc < -32768) this.acc = -32768;
+
+    this.step = Math.floor((this.step * DELTAT_STEP_SCALE[nib & 7]) / 64);
+    if (this.step < 127) this.step = 127;
+    if (this.step > 24576) this.step = 24576;
+    return this.acc;
+  }
+
+  render() {
+    if (!this.playing) return [0, 0];
+
+    const deltaN = (this.regs[0x0a] << 8) | this.regs[0x09];
+    const nibRate = (deltaN / 65536) * (this.clock / 144);
+    this.phase += nibRate / this.outRate;
+    while (this.phase >= 1) {
+      this.phase -= 1;
+      this.prev = this.cur;
+      this.cur = this._decodeNibble();
+      if (!this.playing) break;
+    }
+
+    const panReg = this.regs[0x01];
+    const level = this.regs[0x0b] / 255;
+    const s = ((this.prev + (this.cur - this.prev) * this.phase) / 32768) * level * 0.5;
+    return [(panReg & 0x80) ? s : 0, (panReg & 0x40) ? s : 0];
+  }
+}
+
+// =====================================================================
+//  OPN チップ本体 (YM2203 / YM2608 共通)
+// =====================================================================
+const FM_GAIN = 0.8 / 32768;     // FM 1ch 最大 ≒ 0.2
+const SSG_GAIN = 0.2;            // SSG 1ch 最大 ≒ 0.2
+
+class OPNChip {
+  constructor(type, outRate, clock) {
+    this.is2608 = (type === 2608);
+    this.outRate = outRate;
+    this.clock = clock || (this.is2608 ? 7987200 : 3993600);
+
+    this.channels = Array.from({ length: this.is2608 ? 6 : 3 }, () => new FMChannel());
+    this.ssg = new SSG();
+    if (this.is2608) {
+      this.rhythm = new YM2608Rhythm(outRate);
+      this.adpcm = new YM2608ADPCM(outRate, this.clock);
+    }
+
+    this.prescale = 6;
+    this.egSub = 0;
+    this.egCnt = 0;
+    this.fnLatch = 0;
+    this.ch3Fn = [0, 0, 0];
+    this.ch3Blk = [0, 0, 0];
+    this.ch3Latch = 0;
+    this.ch3Special = false;
+
+    this.lfoOn = false;
+    this.lfoFreq = 0;
+    this.lfoSub = 0;
+    this.lfoCnt = 0;
+    this.lfoAm = 0;
+
+    this.fmL = 0; this.fmR = 0;
+    this.fmRemain = 0;
+    this.ssgVal = 0;
+    this.ssgRemain = 0;
+
+    this.dcL = 0; this.dcR = 0; this.prevL = 0; this.prevR = 0;
+
+    this._updateRates();
+  }
+
+  setAdpcmRam(ram) {
+    if (this.adpcm) this.adpcm.loadRam(ram);
+  }
+
+  _updateRates() {
+    const div = this.prescale;                              // 6 / 3 / 2
+    this.fmRate = this.clock / (this.is2608 ? div * 24 : div * 12);
+    const ssgDiv = div === 6 ? 4 : div === 3 ? 2 : 1;
+    this.ssgRate = this.clock / (this.is2608 ? ssgDiv * 2 : ssgDiv) / 8;
+    this.fmStep = this.fmRate / this.outRate;
+    this.ssgStep = this.ssgRate / this.outRate;
+  }
+
+  // ---- レジスタ書き込み ----
+  write(port, addr, data) {
+    addr &= 0xff;
+    data &= 0xff;
+
+    if (port === 0) {
+      if (addr < 0x10) { this.ssg.write(addr, data); return; }
+      if (this.is2608 && addr <= 0x1d) { this.rhythm.write(addr, data); return; }
+      switch (addr) {
+        case 0x22:
+          if (this.is2608) this._writeLfo(data);
+          return;
+        case 0x27:
+          this._writeMode(data);
+          return;
+        case 0x28:
+          this._writeKey(data);
+          return;
+        case 0x2d: this.prescale = 6; this._updateRates(); return;
+        case 0x2e: this.prescale = 3; this._updateRates(); return;
+        case 0x2f: this.prescale = 2; this._updateRates(); return;
+      }
+    } else {
+      if (!this.is2608) return;
+      if (addr < 0x20) { this.adpcm.write(addr, data); return; }
+    }
+
+    if (addr >= 0x30 && addr < 0xa0) {
+      const c = addr & 3;
+      if (c === 3) return;
+      const idx = c + port * 3;
+      if (idx >= this.channels.length) return;
+      const ch = this.channels[idx];
+      const op = ch.ops[OP_ORDER[(addr >> 2) & 3]];
+      switch (addr & 0xf0) {
+        case 0x30:
+          op.det = (data >> 4) & 7;
+          op.mul2 = (data & 0x0f) ? (data & 0x0f) * 2 : 1;
+          op.recalc();
+          break;
+        case 0x40: op.tl = data & 0x7f; break;
+        case 0x50:
+          op.ks = (data >> 6) & 3;
+          op.ar = data & 0x1f;
+          op.updateKsr();
+          break;
+        case 0x60:
+          op.dr = data & 0x1f;
+          op.am = (data >> 7) & 1;
+          break;
+        case 0x70: op.sr = data & 0x1f; break;
+        case 0x80:
+          op.sl = (data >> 4) & 0x0f;
+          op.rr = data & 0x0f;
+          break;
+        case 0x90:
+          op.ssg = data & 0x0f;
+          if (!(op.ssg & 8)) op.ssgInv = false;
+          break;
+      }
+      return;
+    }
+
+    switch (addr) {
+      case 0xa0: case 0xa1: case 0xa2: {
+        const idx = (addr - 0xa0) + port * 3;
+        if (idx >= this.channels.length) return;
+        const ch = this.channels[idx];
+        ch.fnum = ((this.fnLatch & 7) << 8) | data;
+        ch.block = (this.fnLatch >> 3) & 7;
+        this._applyChFreq(idx);
+        break;
+      }
+      case 0xa4: case 0xa5: case 0xa6:
+        this.fnLatch = data & 0x3f;
+        break;
+      case 0xa8: case 0xa9: case 0xaa: {
+        if (port !== 0) return;
+        const n = addr - 0xa8;
+        this.ch3Fn[n] = ((this.ch3Latch & 7) << 8) | data;
+        this.ch3Blk[n] = (this.ch3Latch >> 3) & 7;
+        this._applyChFreq(2);
+        break;
+      }
+      case 0xac: case 0xad: case 0xae:
+        if (port === 0) this.ch3Latch = data & 0x3f;
+        break;
+      case 0xb0: case 0xb1: case 0xb2: {
+        const idx = (addr - 0xb0) + port * 3;
+        if (idx >= this.channels.length) return;
+        const ch = this.channels[idx];
+        ch.algorithm = data & 7;
+        ch.feedback = (data >> 3) & 7;
+        break;
+      }
+      case 0xb4: case 0xb5: case 0xb6: {
+        if (!this.is2608) return;
+        const idx = (addr - 0xb4) + port * 3;
+        if (idx >= this.channels.length) return;
+        const ch = this.channels[idx];
+        ch.panLeft = (data & 0x80) !== 0;
+        ch.panRight = (data & 0x40) !== 0;
+        ch.ams = (data >> 4) & 3;
+        ch.pms = data & 7;
+        this._updatePm();
+        break;
+      }
+    }
+  }
+
+  _applyChFreq(idx) {
+    const ch = this.channels[idx];
+    const ops = ch.ops;
+    if (idx === 2 && this.ch3Special) {
+      ops[0].setFreq(this.ch3Fn[1], this.ch3Blk[1]);        // 0xa9 → op1
+      ops[1].setFreq(this.ch3Fn[2], this.ch3Blk[2]);        // 0xaa → op2
+      ops[2].setFreq(this.ch3Fn[0], this.ch3Blk[0]);        // 0xa8 → op3
+      ops[3].setFreq(ch.fnum, ch.block);                    // 0xa2 → op4
+    } else {
+      for (let i = 0; i < 4; i++) ops[i].setFreq(ch.fnum, ch.block);
+    }
+  }
+
+  _writeMode(data) {
+    const special = (data & 0xc0) !== 0;
+    if (special !== this.ch3Special) {
+      this.ch3Special = special;
+      this._applyChFreq(2);
+    }
+  }
+
+  _writeKey(data) {
+    const cb = data & 7;
+    if ((cb & 3) === 3) return;
+    const idx = ((cb & 4) ? 3 : 0) + (cb & 3);
+    if (idx >= this.channels.length) return;
+    const ops = this.channels[idx].ops;
+    for (let i = 0; i < 4; i++) ops[i].setKey((data & (0x10 << i)) !== 0);
+  }
+
+  _writeLfo(data) {
+    const on = (data & 8) !== 0;
+    this.lfoFreq = data & 7;
+    if (!on) {
+      this.lfoCnt = 0;
+      this.lfoSub = 0;
+      this.lfoAm = 0;
+    }
+    this.lfoOn = on;
+    this._updatePm();
+  }
+
+  _updatePm() {
+    let tri = 0;
+    if (this.lfoOn) {
+      const t = this.lfoCnt & 0x7f;
+      tri = (t < 32 ? t : t < 96 ? 64 - t : t - 128) / 32;      // -1..+1
+    }
+    for (const ch of this.channels) {
+      const mul = (this.lfoOn && ch.pms) ? Math.pow(2, (tri * PMS_CENTS[ch.pms]) / 1200) : 1;
+      for (const op of ch.ops) {
+        if (op.pmMul !== mul) {
+          op.pmMul = mul;
+          op.recalc();
+        }
+      }
+    }
+  }
+
+  // ---- FM 1 サンプル (ネイティブレート) ----
+  _genFM() {
+    if (this.lfoOn) {
+      if (++this.lfoSub >= LFO_PERIOD[this.lfoFreq]) {
+        this.lfoSub = 0;
+        this.lfoCnt = (this.lfoCnt + 1) & 0x7f;
+        const t = this.lfoCnt;
+        this.lfoAm = ((t & 0x40) ? (t & 0x3f) : (0x3f - (t & 0x3f))) * 2;
+        this._updatePm();
+      }
+    }
+
+    if (++this.egSub >= 3) {
+      this.egSub = 0;
+      this.egCnt = (this.egCnt + 1) & 0xfffff;
+      const cnt = this.egCnt;
+      for (const ch of this.channels) {
+        for (const op of ch.ops) op.clockEnv(cnt);
+      }
+    }
+
+    let l = 0, r = 0;
+    const am = this.lfoAm;
+    for (const ch of this.channels) {
+      const s = ch.render(am);
+      if (ch.panLeft) l += s;
+      if (ch.panRight) r += s;
+    }
+    this.fmL = l;
+    this.fmR = r;
+  }
+
+  // ---- 出力サンプル1つ分 (outRate) ----
+  renderSample() {
+    // FM: ネイティブレート → 出力レートへ箱型平均でリサンプル
+    let need = this.fmStep, sl = 0, sr = 0;
+    while (need > 1e-9) {
+      if (this.fmRemain <= 1e-9) { this._genFM(); this.fmRemain = 1; }
+      const t = this.fmRemain < need ? this.fmRemain : need;
+      sl += this.fmL * t;
+      sr += this.fmR * t;
+      this.fmRemain -= t;
+      need -= t;
+    }
+    const fmL = sl / this.fmStep, fmR = sr / this.fmStep;
+
+    // SSG
+    need = this.ssgStep;
+    let ss = 0;
+    while (need > 1e-9) {
+      if (this.ssgRemain <= 1e-9) { this.ssgVal = this.ssg.clock(); this.ssgRemain = 1; }
+      const t = this.ssgRemain < need ? this.ssgRemain : need;
+      ss += this.ssgVal * t;
+      this.ssgRemain -= t;
+      need -= t;
+    }
+    const ssgOut = (ss / this.ssgStep) * SSG_GAIN;
+
+    let mixL = fmL * FM_GAIN + ssgOut;
+    let mixR = fmR * FM_GAIN + ssgOut;
+
+    if (this.is2608) {
+      const [rl, rr] = this.rhythm.render();
+      const [al, ar] = this.adpcm.render();
+      mixL += rl + al;
+      mixR += rr + ar;
+    }
+
+    // カップリングコンデンサ相当の DC カット (SSG は単極性のため)
+    const oL = mixL - this.prevL + 0.995 * this.dcL;
+    const oR = mixR - this.prevR + 0.995 * this.dcR;
+    this.prevL = mixL; this.prevR = mixR;
+    this.dcL = oL; this.dcR = oR;
+
+    return [oL, oR];
+  }
+}
+
+class YM2203 extends OPNChip {
+  constructor(sampleRate, clock) { super(2203, sampleRate, clock); }
+}
+class YM2608 extends OPNChip {
+  constructor(sampleRate, clock) { super(2608, sampleRate, clock); }
+}
+
+// =====================================================================
+//  メインスレッド用 VGM プレイヤー (ScriptProcessor)
+// =====================================================================
+class VGMPlayer {
+  constructor(audioCtx, vgmSampleRate = 44100) {
+    this.audioCtx = audioCtx;
+    this.vgmRate = vgmSampleRate;
+    this.chip2203 = null;
+    this.chip2608 = null;
+    this.cfg = null;
+    this.events = [];
+    this.eventIndex = 0;
+    this.totalSamples = 0;
+    this.loopSampleOffset = -1;
+    this.currentSample = 0;
+    this.playing = false;
+    this.loopEnabled = true;
+    this.ended = false;
+
+    this.outAccumPos = 0;
+    this.prevL = 0; this.prevR = 0;
+    this.curL = 0; this.curR = 0;
+    this._posCounter = 0;
+
+    this.onPosition = null;
+    this.onEnded = null;
+    this.onLooped = null;
+
+    this.node = this.audioCtx.createScriptProcessor(4096, 0, 2);
+    this.node.onaudioprocess = (e) => this._process(e);
+  }
+
+  connect(destination) { this.node.connect(destination); }
+  disconnect() { try { this.node.disconnect(); } catch (e) { /* ignore */ } }
+
+  _createChips() {
+    const c = this.cfg;
+    this.chip2203 = c.ym2203Clock ? new OPNChip(2203, this.vgmRate, c.ym2203Clock) : null;
+    this.chip2608 = c.ym2608Clock ? new OPNChip(2608, this.vgmRate, c.ym2608Clock) : null;
+    if (this.chip2608 && c.adpcmRam) this.chip2608.setAdpcmRam(c.adpcmRam);
+    this.prevL = this.prevR = this.curL = this.curR = 0;
+    this.outAccumPos = 0;
+  }
+
+  load(vgmParser) {
+    this.events = vgmParser.events;
+    this.totalSamples = vgmParser.totalSamples;
+    this.loopSampleOffset = vgmParser.loopSampleOffset;
+    this.eventIndex = 0;
+    this.currentSample = 0;
+
+    const h = vgmParser.header;
+    let c2203 = h.ym2203Clock, c2608 = h.ym2608Clock;
+    if (!c2203 && !c2608) {                                   // ヘッダにクロックが無い場合はイベント種別から判断
+      const has2608 = this.events.some(e => e.type === 'ym2608');
+      const has2203 = this.events.some(e => e.type === 'ym2203');
+      if (has2608) c2608 = 7987200;
+      if (has2203 || !has2608) c2203 = 3993600;
+    }
+    this.cfg = { ym2203Clock: c2203, ym2608Clock: c2608, adpcmRam: vgmParser.adpcmRam };
+    this._createChips();
+    this.ended = false;
+    this.playing = false;
+  }
+
+  play() { this.playing = true; }
+  pause() { this.playing = false; }
+
+  stop() {
+    this.playing = false;
+    this.currentSample = 0;
+    this.eventIndex = 0;
+    this._createChips();
+  }
+
+  _dispatch(ev) {
+    if (ev.type === 'ym2203') {
+      if (this.chip2203) this.chip2203.write(0, ev.addr, ev.data);
+    } else if (ev.type === 'ym2608') {
+      if (this.chip2608) this.chip2608.write(ev.port, ev.addr, ev.data);
+    }
+  }
+
+  seekSample(targetSample) {
+    this._createChips();
+    let i = 0;
+    while (i < this.events.length && this.events[i].sampleOffset <= targetSample) {
+      this._dispatch(this.events[i]);
+      i++;
+    }
+    this.eventIndex = i;
+    this.currentSample = targetSample;
+  }
+
+  setLoop(enabled) { this.loopEnabled = enabled; }
+
+  _renderChips() {
+    let l = 0, r = 0;
+    if (this.chip2203) { const s = this.chip2203.renderSample(); l += s[0]; r += s[1]; }
+    if (this.chip2608) { const s = this.chip2608.renderSample(); l += s[0]; r += s[1]; }
+    return [l, r];
+  }
+
+  _advanceOneVgmSample() {
+    while (this.eventIndex < this.events.length && this.events[this.eventIndex].sampleOffset <= this.currentSample) {
+      const ev = this.events[this.eventIndex];
+      if (ev.type === 'end') {
+        if (this.loopEnabled && this.loopSampleOffset >= 0) {
+          this.currentSample = this.loopSampleOffset;
+          let li = 0;
+          while (li < this.events.length && this.events[li].sampleOffset < this.loopSampleOffset) li++;
+          this.eventIndex = li;
+          if (this.onLooped) this.onLooped();
+          continue;
+        }
+        this.ended = true;
+        this.playing = false;
+        if (this.onEnded) this.onEnded();
+        break;
+      }
+      this._dispatch(ev);
+      this.eventIndex++;
+    }
+    const sample = this._renderChips();
+    this.currentSample++;
+    return sample;
+  }
+
+  _process(e) {
+    const left = e.outputBuffer.getChannelData(0);
+    const right = e.outputBuffer.getChannelData(1);
+    const ratio = this.vgmRate / this.audioCtx.sampleRate;
+
+    for (let i = 0; i < left.length; i++) {
+      if (!this.playing || this.ended) {
+        left[i] = 0;
+        right[i] = 0;
+        continue;
+      }
+
+      // VGM レート(44.1kHz) → デバイスレートを線形補間で変換
+      this.outAccumPos += ratio;
+      while (this.outAccumPos >= 1) {
+        this.prevL = this.curL;
+        this.prevR = this.curR;
+        const res = this._advanceOneVgmSample();
+        this.curL = res[0];
+        this.curR = res[1];
+        this.outAccumPos -= 1;
+        if (this.ended) break;
+      }
+      const t = this.outAccumPos;
+      const sL = this.prevL + (this.curL - this.prevL) * t;
+      const sR = this.prevR + (this.curR - this.prevR) * t;
+
+      left[i] = sL > 1 ? 1 : sL < -1 ? -1 : sL;
+      right[i] = sR > 1 ? 1 : sR < -1 ? -1 : sR;
+    }
+
+    this._posCounter += left.length;
+    if (this._posCounter > 4096) {
+      this._posCounter = 0;
+      if (this.onPosition) {
+        this.onPosition({ sample: this.currentSample, total: this.totalSamples });
+      }
+    }
+  }
+}
+
+if (typeof module !== 'undefined') {
+  module.exports = { VGMParser, OPNChip, YM2203, YM2608, VGMPlayer };
+}
+
+</script>
 <script>
  
 
@@ -55,6 +1340,7 @@ const CHANNEL_DEFS = [
 const state = {
   audioCtx: null,
   workletNode: null,
+  player: null,
   gainNode: null,
   analyser: null,
   vgm: null,           // parsed VGMParser instance
@@ -118,11 +1404,17 @@ async function loadFile(file) {
 
     //populateMeta(parser, file.name);
     await ensureAudio();
+    if (state.player) {
+      state.player.pause();
+      state.player.disconnect();
+    }
     const player = new VGMPlayer(state.audioCtx);
-player.connect(state.audioCtx.destination);
+    player.connect(state.audioCtx.destination);
     player.load(parser);
     player.play();
-   
+    state.player = player;
+    state.playing = true;
+
     state.loaded = true;
    
    
@@ -227,10 +1519,10 @@ async function togglePlay() {
   if (state.audioCtx.state === 'suspended') await state.audioCtx.resume();
 
   state.playing = !state.playing;
-  
-    
-    
-    player.play();
+  if (state.player) {
+    if (state.playing) state.player.play();
+    else state.player.pause();
+  }
   setStatus(state.playing ? '再生中' : '一時停止');
 }
 
