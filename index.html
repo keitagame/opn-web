@@ -56,6 +56,11 @@ class VGMParser {
 
     h.ym2203Clock = 0;
     h.ym2608Clock = 0;
+    h.ym2612Clock = 0;
+    h.ym2151Clock = 0;
+    h.sn76489Clock = 0;
+    h.snFeedback = 0x0009;
+    h.snShiftWidth = 16;
     h.dataOffset = 0x40;
 
     if (h.version >= 0x150) {
@@ -66,6 +71,19 @@ class VGMParser {
       // bit30 はデュアルチップ指定なのでマスクする
       h.ym2203Clock = this._readU32(0x44) & 0x3fffffff;
       h.ym2608Clock = this._readU32(0x48) & 0x3fffffff;
+    }
+
+    // SN76489 (メガドライブ PSG) / YM2612 (メガドライブ FM) / YM2151 (X68000 FM)
+    if (this.buf.length >= 0x10) h.sn76489Clock = this._readU32(0x0c) & 0x3fffffff;
+    if (h.version >= 0x110) {
+      if (h.dataOffset >= 0x2c) {
+        const fb = this._readU16(0x28);
+        const sw = this.buf[0x2a];
+        if (fb) h.snFeedback = fb;
+        if (sw) h.snShiftWidth = sw;
+      }
+      if (h.dataOffset >= 0x30) h.ym2612Clock = this._readU32(0x2c) & 0x3fffffff;
+      if (h.dataOffset >= 0x34) h.ym2151Clock = this._readU32(0x30) & 0x3fffffff;
     }
 
     this.totalSamples = h.totalSamples;
@@ -115,10 +133,43 @@ class VGMParser {
 
   _parseCommands() {
     const buf = this.buf;
+    const events = this.events;
     let p = this.header.dataOffset;
     const end = this.header.gd3Offset ? Math.min(buf.length, this.header.gd3Offset + 0x14) : buf.length;
     let sampleOffset = 0;
     const loopStartByte = this.loopByteOffset;
+
+    // YM2612 PCM データバンク (データブロック type 0x00) と DAC ストリーム
+    let bank = new Uint8Array(0);
+    const blocks = [];
+    let pcmPos = 0;
+    const streams = {};
+    let usedStreams = false;
+
+    // 待ち時間を進める。動作中の DAC ストリームがあれば、その間の書き込みイベントを生成する
+    const advance = (n) => {
+      const target = sampleOffset + n;
+      for (const id in streams) {
+        const s = streams[id];
+        if (!s.active || s.freq <= 0) continue;
+        const interval = 44100 / s.freq;
+        let guard = 0;
+        while (s.active && s.nextT < target && guard++ < 4000000) {
+          if (s.pos < 0 || s.pos >= bank.length) {
+            if (s.loop && s.len !== 0 && s.startPos < bank.length) { s.pos = s.startPos; s.remaining = s.len; }
+            else { s.active = false; break; }
+          }
+          events.push({ sampleOffset: s.nextT, type: 'ym2612', port: s.port, addr: s.reg, data: bank[s.pos] });
+          usedStreams = true;
+          s.pos += s.step;
+          s.nextT += interval;
+          if (s.remaining > 0 && --s.remaining === 0) {
+            if (s.loop) { s.pos = s.startPos; s.remaining = s.len; } else s.active = false;
+          }
+        }
+      }
+      sampleOffset = target;
+    };
 
     while (p < end && p < buf.length) {
       const cmd = buf[p];
@@ -128,33 +179,54 @@ class VGMParser {
       }
 
       if (cmd === 0x66) {
-        this.events.push({ sampleOffset, type: 'end' });
+        events.push({ sampleOffset, type: 'end' });
         break;
       } else if (cmd === 0x55) {                         // YM2203
-        this.events.push({ sampleOffset, type: 'ym2203', addr: buf[p + 1], data: buf[p + 2] });
+        events.push({ sampleOffset, type: 'ym2203', addr: buf[p + 1], data: buf[p + 2] });
         p += 3;
       } else if (cmd === 0x56 || cmd === 0x57) {         // YM2608 port0 / port1
-        this.events.push({ sampleOffset, type: 'ym2608', port: cmd === 0x57 ? 1 : 0, addr: buf[p + 1], data: buf[p + 2] });
+        events.push({ sampleOffset, type: 'ym2608', port: cmd === 0x57 ? 1 : 0, addr: buf[p + 1], data: buf[p + 2] });
         p += 3;
+      } else if (cmd === 0x52 || cmd === 0x53) {         // YM2612 port0 / port1 (メガドライブ)
+        events.push({ sampleOffset, type: 'ym2612', port: cmd === 0x53 ? 1 : 0, addr: buf[p + 1], data: buf[p + 2] });
+        p += 3;
+      } else if (cmd === 0x54) {                         // YM2151 (X68000)
+        events.push({ sampleOffset, type: 'ym2151', addr: buf[p + 1], data: buf[p + 2] });
+        p += 3;
+      } else if (cmd === 0x50) {                         // SN76489 (メガドライブ PSG)
+        events.push({ sampleOffset, type: 'sn76489', data: buf[p + 1] });
+        p += 2;
+      } else if (cmd === 0x4f) {                         // Game Gear PSG ステレオ
+        events.push({ sampleOffset, type: 'psgstereo', data: buf[p + 1] });
+        p += 2;
       } else if (cmd === 0x61) {
-        sampleOffset += this._readU16(p + 1);
+        advance(this._readU16(p + 1));
         p += 3;
       } else if (cmd === 0x62) {
-        sampleOffset += 735;
+        advance(735);
         p += 1;
       } else if (cmd === 0x63) {
-        sampleOffset += 882;
+        advance(882);
         p += 1;
       } else if (cmd >= 0x70 && cmd <= 0x7f) {
-        sampleOffset += (cmd & 0x0f) + 1;
+        advance((cmd & 0x0f) + 1);
         p += 1;
-      } else if (cmd >= 0x80 && cmd <= 0x8f) {
-        sampleOffset += (cmd & 0x0f);
+      } else if (cmd >= 0x80 && cmd <= 0x8f) {           // YM2612 DAC 書き込み + 待ち
+        events.push({ sampleOffset, type: 'ym2612', port: 0, addr: 0x2a, data: pcmPos < bank.length ? bank[pcmPos] : 0x80 });
+        pcmPos++;
+        advance(cmd & 0x0f);
         p += 1;
       } else if (cmd === 0x67) {                         // data block
         const dataType = buf[p + 2];
         const size = this._readU32(p + 3);
-        if (dataType === 0x81) {
+        if (dataType === 0x00) {
+          // YM2612 PCM データ
+          const chunk = buf.subarray(p + 7, Math.min(buf.length, p + 7 + size));
+          const nb = new Uint8Array(bank.length + chunk.length);
+          nb.set(bank); nb.set(chunk, bank.length);
+          blocks.push({ start: bank.length, len: chunk.length });
+          bank = nb;
+        } else if (dataType === 0x81) {
           // YM2608 DELTA-T ROM: [全体サイズ(4)] [開始アドレス(4)] [データ...]
           const romSize = this._readU32(p + 7);
           const startAddr = this._readU32(p + 11);
@@ -165,6 +237,9 @@ class VGMParser {
           }
         }
         p += 7 + size;
+      } else if (cmd === 0xe0) {                         // PCM バンクのシーク
+        pcmPos = this._readU32(p + 1);
+        p += 5;
       } else if (cmd === 0x68) {
         p += 12;
       } else if (cmd === 0x64) {
@@ -172,12 +247,56 @@ class VGMParser {
       } else if ((cmd >= 0x30 && cmd <= 0x3f) || cmd === 0x4f || cmd === 0x50) {
         p += 2;
       } else if ((cmd >= 0x40 && cmd <= 0x4e) || (cmd >= 0x51 && cmd <= 0x5f) || (cmd >= 0xa0 && cmd <= 0xbf)) {
-        p += 3;                                          // 他チップ(YM2612等)のコマンドは読み飛ばす
-      } else if (cmd >= 0x90 && cmd <= 0x95) {
-        if (cmd === 0x90 || cmd === 0x91 || cmd === 0x95) p += 5;
-        else if (cmd === 0x92) p += 6;
-        else if (cmd === 0x93) p += 11;
-        else p += 2;
+        p += 3;                                          // 他チップのコマンドは読み飛ばす
+      } else if (cmd === 0x90) {                         // DAC ストリーム設定: ss tt pp cc
+        streams[buf[p + 1]] = {
+          chip: buf[p + 2] & 0x7f, port: buf[p + 3], reg: buf[p + 4],
+          freq: 0, active: false, step: 1, pos: 0, startPos: 0, len: -1, remaining: -1, loop: false, nextT: 0,
+        };
+        p += 5;
+      } else if (cmd === 0x91) {                         // データバンク指定: ss dd ll bb
+        const s = streams[buf[p + 1]];
+        if (s) s.step = Math.max(1, buf[p + 3]);
+        p += 5;
+      } else if (cmd === 0x92) {                         // ストリーム周波数
+        const s = streams[buf[p + 1]];
+        if (s) s.freq = this._readU32(p + 2);
+        p += 6;
+      } else if (cmd === 0x93) {                         // ストリーム開始: ss aaaaaaaa mm llllllll
+        const s = streams[buf[p + 1]];
+        if (s) {
+          const start = this._readU32(p + 2);
+          const mode = buf[p + 6];
+          const len = this._readU32(p + 7);
+          if (start !== 0xffffffff) s.pos = start;
+          s.startPos = s.pos;
+          s.loop = (mode & 0x10) !== 0;
+          const m = mode & 0x0f;
+          if (m === 1) s.len = len;
+          else if (m === 2) s.len = Math.floor(len * s.freq / 1000);
+          else if (m === 3) s.len = Math.max(0, Math.floor((bank.length - s.pos) / s.step));
+          else s.len = -1;
+          s.remaining = s.len;
+          s.nextT = sampleOffset;
+          s.active = (s.chip === 0x02);                  // YM2612 のみ対応
+        }
+        p += 11;
+      } else if (cmd === 0x94) {                         // ストリーム停止
+        if (buf[p + 1] === 0xff) { for (const id in streams) streams[id].active = false; }
+        else if (streams[buf[p + 1]]) streams[buf[p + 1]].active = false;
+        p += 2;
+      } else if (cmd === 0x95) {                         // ブロック ID 指定で開始: ss bbbb ff
+        const s = streams[buf[p + 1]];
+        const blk = blocks[this._readU16(p + 2)];
+        if (s && blk) {
+          s.pos = blk.start; s.startPos = blk.start;
+          s.len = Math.floor(blk.len / s.step);
+          s.remaining = s.len;
+          s.loop = (buf[p + 4] & 1) !== 0;
+          s.nextT = sampleOffset;
+          s.active = (s.chip === 0x02);
+        }
+        p += 5;
       } else if (cmd >= 0xc0 && cmd <= 0xdf) {
         p += 4;
       } else if (cmd >= 0xe0) {
@@ -187,9 +306,10 @@ class VGMParser {
       }
     }
 
-    if (this.events.length === 0 || this.events[this.events.length - 1].type !== 'end') {
-      this.events.push({ sampleOffset, type: 'end' });
+    if (events.length === 0 || events[events.length - 1].type !== 'end') {
+      events.push({ sampleOffset, type: 'end' });
     }
+    if (usedStreams) events.sort((a, b) => a.sampleOffset - b.sampleOffset);   // 安定ソート
   }
 }
 
@@ -1260,6 +1380,500 @@ class YM2608 extends OPNChip {
 }
 
 // =====================================================================
+//  YM2612 (OPN2 / メガドライブ FM 音源)
+//   FM 部は OPN 共通コアを流用。SSG / リズム / ADPCM は無く、6ch 目が DAC として使える
+// =====================================================================
+class YM2612 extends OPNChip {
+  constructor(sampleRate, clock) {
+    super(2608, sampleRate, clock || 7670454);     // 6ch・LFO・パンなど FM 部の挙動は YM2608 と同じ
+    this.rhythm = null; this.adpcm = null; this.ssg = null;
+    this.dacEn = false;
+    this.dacOut = 0;
+    this.levels = new Float64Array(6);             // 表示用のチャンネルレベル
+  }
+
+  write(port, addr, data) {
+    addr &= 0xff; data &= 0xff;
+    if (port === 0) {
+      if (addr === 0x2a) { this.dacOut = (data - 128) * 64; return; }
+      if (addr === 0x2b) { this.dacEn = (data & 0x80) !== 0; return; }
+      if (addr < 0x30 && addr !== 0x22 && addr !== 0x27 && addr !== 0x28) return;   // タイマ等は不要
+    } else if (addr < 0x30) {
+      return;
+    }
+    super.write(port, addr, data);
+  }
+
+  _genFMHi() {
+    if (++this.osSub >= FM_OS) { this.osSub = 0; this._nativeTick(); }
+    let l = 0, r = 0;
+    const am = this.lfoAm, chs = this.channels, lv = this.levels;
+    for (let i = 0; i < 6; i++) {
+      const ch = chs[i];
+      const s = (i === 5 && this.dacEn) ? this.dacOut : ch.render(am);
+      const a = s < 0 ? -s : s;
+      lv[i] = a > lv[i] ? a : lv[i] * 0.99998;
+      if (ch.panLeft) l += s;
+      if (ch.panRight) r += s;
+    }
+    this.fmL = l;
+    this.fmR = r;
+  }
+
+  renderSample() {
+    this.fmAcc += this.fmHiStep;
+    while (this.fmAcc >= 1) {
+      this.fmAcc -= 1;
+      this._genFMHi();
+      this.fmPrevL = this.fmCurL; this.fmPrevR = this.fmCurR;
+      this.fmCurL = this.fmFiltL.process(this.fmL);
+      this.fmCurR = this.fmFiltR.process(this.fmR);
+    }
+    const ft = this.fmAcc;
+    const mixL = (this.fmPrevL + (this.fmCurL - this.fmPrevL) * ft) * FM_GAIN;
+    const mixR = (this.fmPrevR + (this.fmCurR - this.fmPrevR) * ft) * FM_GAIN;
+    const k = this.dcCoef;
+    const oL = mixL - this.prevL + k * this.dcL;
+    const oR = mixR - this.prevR + k * this.dcR;
+    this.prevL = mixL; this.prevR = mixR;
+    this.dcL = oL; this.dcR = oR;
+    const o = this._o;
+    o[0] = oL; o[1] = oR;
+    return o;
+  }
+}
+
+// =====================================================================
+//  YM2151 (OPM / X68000 FM 音源)
+//   オペレータ/EG は OPN と同じ構造。ピッチは KC/KF/DT2 から直接計算する
+// =====================================================================
+const OPM_PMS_CENTS = [0, 5, 10, 20, 50, 100, 400, 700];   // PMS ごとの最大ビブラート幅 (cent)
+const OPM_DT2_CENTS = [0, 600, 781, 950];
+// KC=0x4A (A4) を 440Hz とした位相増分 (2^20 = 1周期 / FM 1サンプル)。クロックに依らず一定
+const OPM_BASE_INC = 440 * 64 * 1048576 / 3579545;
+
+class OPMOperator extends FMOperator {
+  constructor() {
+    super();
+    this.kc7 = 0; this.kf = 0; this.dt2 = 0;
+    this.baseInc = 0;
+    this.noise = false;
+    this.noiseBit = 1;
+  }
+
+  setPitch(kc7, kf) {
+    this.kc7 = kc7; this.kf = kf;
+    this.kc = (kc7 >> 2) & 31;            // KS / DT1 に使う 5bit キーコード
+    this._calcBase();
+    this.updateKsr();
+  }
+
+  setDt2(v) { this.dt2 = v; this._calcBase(); }
+
+  _calcBase() {
+    const n = this.kc7 & 15;
+    const s = n - (n >> 2);                // C# D D# E F F# G G# A A# B C → 0..11
+    const semi = (((this.kc7 >> 4) & 7) - 4) * 12 + (s - 8) + this.kf / 64;
+    this.baseInc = OPM_BASE_INC * Math.pow(2, semi / 12 + OPM_DT2_CENTS[this.dt2] / 1200);
+    this.recalc();
+  }
+
+  recalc() {
+    let inc = this.baseInc;
+    if (this.pmMul !== 1) inc *= this.pmMul;
+    const mag = this.det & 3;
+    if (mag) {
+      const d = DETUNE_TABLE[this.kc][mag];
+      inc += (this.det & 4) ? -d : d;
+    }
+    if (inc < 0) inc = 0;
+    this.phaseInc = inc * this.mul2 * 0.5;
+    this.phaseStep = this.phaseInc / FM_OS;
+  }
+
+  calc(mod, am) {
+    if (!this.noise) return super.calc(mod, am);
+    let e = this.att;
+    if (this.am) e += am;
+    e += this.tl << 3;
+    if (e > 0x3ff) e = 0x3ff;
+    return this.noiseBit ? ENV_AMP[e] : -ENV_AMP[e];
+  }
+}
+
+class OPMChannel extends FMChannel {
+  constructor() {
+    super();
+    this.ops = [new OPMOperator(), new OPMOperator(), new OPMOperator(), new OPMOperator()];
+    this.ams = 3;                // render() 内の AMS_SHIFT を 0 にして、AM 量はチップ側で計算して渡す
+    this.amsReg = 0;
+    this.pmsReg = 0;
+    this.kc = 0;
+    this.kf = 0;
+  }
+}
+
+class YM2151 {
+  constructor(outRate, clock) {
+    this.outRate = outRate;
+    this.clock = clock || 3579545;
+    this.channels = Array.from({ length: 8 }, () => new OPMChannel());
+    this.levels = new Float64Array(8);
+
+    this.fmRate = this.clock / 64;
+    this.fmHiStep = (this.fmRate * FM_OS) / outRate;
+    this.egSub = 0; this.egCnt = 0; this.osSub = 0;
+
+    // LFO
+    this.lfoTimer = 0;
+    this.lfoOverflow = 1 << 18;
+    this.lfoAdd = 16;
+    this.lfoCounter = 0;
+    this.lfoWave = 0;
+    this.pmd = 0; this.amd = 0;
+    this.lfa = 0;                // AM 量 (0~254)
+    this.lfp = 0;                // PM 波形値 (-128~127) × PMD
+    this.lfoRandAm = 0; this.lfoRandPm = 0;
+
+    // ノイズ (ch8 の C2 スロット)
+    this.noiseEn = false;
+    this.noiseStep = 0;
+    this.noiseAcc = 0;
+    this.noiseRng = 0x1ffff;
+
+    this.fmL = 0; this.fmR = 0;
+    this.fmAcc = 0;
+    this.fmPrevL = 0; this.fmPrevR = 0; this.fmCurL = 0; this.fmCurR = 0;
+    this.fmFiltL = new OutFilter();
+    this.fmFiltR = new OutFilter();
+    const nyq = outRate / 2, fmFs = this.fmRate * FM_OS;
+    this.fmFiltL.design(fmFs, Math.min(HQ.fmLowpassHz, nyq * 0.9), HQ.fmShelfHz, HQ.fmShelfDb);
+    this.fmFiltR.design(fmFs, Math.min(HQ.fmLowpassHz, nyq * 0.9), HQ.fmShelfHz, HQ.fmShelfDb);
+
+    this.dcCoef = Math.pow(0.9995, 44100 / outRate);
+    this.dcL = 0; this.dcR = 0; this.prevL = 0; this.prevR = 0;
+    this._o = [0, 0];
+    this._lfoUpdate();
+  }
+
+  write(addr, data) {
+    addr &= 0xff; data &= 0xff;
+    if (addr < 0x20) {
+      switch (addr) {
+        case 0x01:
+          if (data & 2) { this.lfoCounter = 0; this.lfoTimer = 0; this._lfoUpdate(); }
+          break;
+        case 0x08: {
+          const ops = this.channels[data & 7].ops;
+          for (let k = 0; k < 4; k++) ops[OP_ORDER[k]].setKey((data & (8 << k)) !== 0);
+          break;
+        }
+        case 0x0f: {
+          this.noiseEn = (data & 0x80) !== 0;
+          this.noiseStep = 2 / (32 - (data & 0x1f));      // クロック/(32×(32-NFRQ)) を FM レートに換算
+          this.channels[7].ops[3].noise = this.noiseEn;
+          break;
+        }
+        case 0x18: {
+          this.lfoOverflow = 1 << (18 - (data >> 4));
+          this.lfoAdd = 16 + (data & 15);
+          break;
+        }
+        case 0x19:
+          if (data & 0x80) this.pmd = data & 0x7f; else this.amd = data & 0x7f;
+          this._lfoUpdate();
+          break;
+        case 0x1b:
+          this.lfoWave = data & 3;
+          this._lfoUpdate();
+          break;
+      }
+      return;
+    }
+
+    const ch = this.channels[addr & 7];
+    if (addr < 0x40) {
+      switch (addr & 0xf8) {
+        case 0x20:
+          ch.panRight = (data & 0x80) !== 0;
+          ch.panLeft = (data & 0x40) !== 0;
+          ch.feedback = (data >> 3) & 7;
+          ch.algorithm = data & 7;
+          break;
+        case 0x28: ch.kc = data & 0x7f; this._applyPitch(ch); break;
+        case 0x30: ch.kf = data >> 2; this._applyPitch(ch); break;
+        case 0x38:
+          ch.pmsReg = (data >> 4) & 7;
+          ch.amsReg = data & 3;
+          this._updatePm();
+          break;
+      }
+      return;
+    }
+
+    const op = ch.ops[OP_ORDER[(addr >> 3) & 3]];
+    switch (addr & 0xe0) {
+      case 0x40:
+        op.det = (data >> 4) & 7;
+        op.mul2 = (data & 0x0f) ? (data & 0x0f) * 2 : 1;
+        op.recalc();
+        break;
+      case 0x60: op.tl = data & 0x7f; break;
+      case 0x80:
+        op.ks = (data >> 6) & 3;
+        op.ar = data & 0x1f;
+        op.updateKsr();
+        break;
+      case 0xa0:
+        op.am = (data >> 7) & 1;
+        op.dr = data & 0x1f;
+        break;
+      case 0xc0:
+        op.sr = data & 0x1f;
+        op.setDt2((data >> 6) & 3);
+        break;
+      case 0xe0:
+        op.sl = (data >> 4) & 0x0f;
+        op.rr = data & 0x0f;
+        break;
+    }
+  }
+
+  _applyPitch(ch) {
+    for (let i = 0; i < 4; i++) ch.ops[i].setPitch(ch.kc, ch.kf);
+  }
+
+  // LFO 波形値の更新 (AM: 0~255 / PM: -128~127)
+  _lfoUpdate() {
+    const p = (this.lfoCounter >> 4) & 0xff;
+    let am, pm;
+    switch (this.lfoWave) {
+      case 0: am = 255 - p; pm = p < 128 ? p : p - 256; break;                       // のこぎり波
+      case 1: am = p < 128 ? 255 : 0; pm = p < 128 ? 127 : -128; break;              // 矩形波
+      case 2:                                                                         // 三角波
+        am = p < 128 ? p << 1 : (255 - p) << 1;
+        pm = p < 64 ? p * 2 : p < 192 ? (128 - p) * 2 : (p - 256) * 2;
+        if (pm > 127) pm = 127; else if (pm < -128) pm = -128;
+        break;
+      default:                                                                        // ノイズ
+        this.lfoRandAm = (Math.random() * 256) | 0;
+        this.lfoRandPm = ((Math.random() * 256) | 0) - 128;
+        am = this.lfoRandAm; pm = this.lfoRandPm;
+        break;
+    }
+    this.lfa = (am * this.amd) >> 7;
+    this.lfp = pm * this.pmd / 127;
+    this._updatePm();
+  }
+
+  _updatePm() {
+    const x = this.lfp / 128;
+    for (const ch of this.channels) {
+      const mul = ch.pmsReg ? Math.pow(2, (x * OPM_PMS_CENTS[ch.pmsReg]) / 1200) : 1;
+      for (const op of ch.ops) {
+        if (op.pmMul !== mul) { op.pmMul = mul; op.recalc(); }
+      }
+    }
+  }
+
+  // ---- ネイティブレート 1 サンプルごとの内部更新 (LFO / EG / ノイズ) ----
+  _nativeTick() {
+    if (this.pmd | this.amd) {
+      if (++this.lfoTimer >= this.lfoOverflow) {
+        this.lfoTimer -= this.lfoOverflow;
+        this.lfoCounter = (this.lfoCounter + this.lfoAdd) & 0xfff;
+        this._lfoUpdate();
+      }
+    }
+    if (++this.egSub >= 3) {
+      this.egSub = 0;
+      this.egCnt = (this.egCnt + 1) & 0xfffff;
+      const cnt = this.egCnt;
+      for (const ch of this.channels) for (const op of ch.ops) op.clockEnv(cnt);
+    }
+    if (this.noiseEn) {
+      this.noiseAcc += this.noiseStep;
+      while (this.noiseAcc >= 1) {
+        this.noiseAcc -= 1;
+        const r = this.noiseRng;
+        this.noiseRng = (r >> 1) | ((((r ^ (r >> 3)) & 1) ^ 1) << 16);
+      }
+      this.channels[7].ops[3].noiseBit = this.noiseRng & 1;
+    }
+  }
+
+  _genFMHi() {
+    if (++this.osSub >= FM_OS) { this.osSub = 0; this._nativeTick(); }
+    let l = 0, r = 0;
+    const chs = this.channels, lv = this.levels, lfa = this.lfa;
+    for (let i = 0; i < 8; i++) {
+      const ch = chs[i];
+      const s = ch.render(ch.amsReg ? (lfa << (ch.amsReg - 1)) : 0);
+      const a = s < 0 ? -s : s;
+      lv[i] = a > lv[i] ? a : lv[i] * 0.99998;
+      if (ch.panLeft) l += s;
+      if (ch.panRight) r += s;
+    }
+    this.fmL = l;
+    this.fmR = r;
+  }
+
+  renderSample() {
+    this.fmAcc += this.fmHiStep;
+    while (this.fmAcc >= 1) {
+      this.fmAcc -= 1;
+      this._genFMHi();
+      this.fmPrevL = this.fmCurL; this.fmPrevR = this.fmCurR;
+      this.fmCurL = this.fmFiltL.process(this.fmL);
+      this.fmCurR = this.fmFiltR.process(this.fmR);
+    }
+    const ft = this.fmAcc;
+    const mixL = (this.fmPrevL + (this.fmCurL - this.fmPrevL) * ft) * FM_GAIN;
+    const mixR = (this.fmPrevR + (this.fmCurR - this.fmPrevR) * ft) * FM_GAIN;
+    const k = this.dcCoef;
+    const oL = mixL - this.prevL + k * this.dcL;
+    const oR = mixR - this.prevR + k * this.dcR;
+    this.prevL = mixL; this.prevR = mixR;
+    this.dcL = oL; this.dcR = oR;
+    const o = this._o;
+    o[0] = oL; o[1] = oR;
+    return o;
+  }
+}
+
+// =====================================================================
+//  SN76489 (メガドライブ PSG)  矩形波 3ch + ノイズ 1ch
+// =====================================================================
+const SN_LEVELS = (() => {
+  const t = new Float64Array(16);
+  for (let i = 0; i < 15; i++) t[i] = Math.pow(10, -2 * i / 20);     // 2dB ステップ
+  t[15] = 0;
+  return t;
+})();
+const SN_GAIN = 0.1;
+
+class SN76489 {
+  constructor(outRate, clock, feedback, width) {
+    this.outRate = outRate;
+    this.clock = clock || 3579545;
+    this.fbMask = feedback || 0x0009;
+    this.width = width || 16;
+    this.period = [0, 0, 0];
+    this.cnt = [1, 1, 1];
+    this.out = [0, 0, 0];
+    this.vol = [15, 15, 15, 15];
+    this.nreg = 0;
+    this.ncnt = 16;
+    this.nff = 0;
+    this.lfsr = 1 << (this.width - 1);
+    this.latch = 0;
+    this.stereo = 0xff;
+
+    this.psgRate = this.clock / 16;
+    this.step = this.psgRate / outRate;
+    this.acc = 0;
+    this.prevL = 0; this.prevR = 0; this.curL = 0; this.curR = 0;
+    this.filtL = new OutFilter();
+    this.filtR = new OutFilter();
+    const fc = Math.min(HQ.ssgLowpassHz, (outRate / 2) * 0.9);
+    this.filtL.design(this.psgRate, fc, 0, 0);
+    this.filtR.design(this.psgRate, fc, 0, 0);
+
+    this.dcCoef = Math.pow(0.9995, 44100 / outRate);
+    this.dcL = 0; this.dcR = 0; this.dprevL = 0; this.dprevR = 0;
+    this._o = [0, 0];
+  }
+
+  setStereo(v) { this.stereo = v & 0xff; }
+
+  write(data) {
+    data &= 0xff;
+    let reg, low;
+    if (data & 0x80) {
+      this.latch = (data >> 4) & 7;
+      reg = this.latch; low = true;
+    } else {
+      reg = this.latch; low = false;
+    }
+    const ch = reg >> 1;
+    if (reg & 1) {                                   // 音量
+      this.vol[ch] = data & 15;
+    } else if (ch < 3) {                             // トーン周期
+      if (low) this.period[ch] = (this.period[ch] & 0x3f0) | (data & 15);
+      else this.period[ch] = (this.period[ch] & 0x00f) | ((data & 0x3f) << 4);
+    } else {                                         // ノイズ制御
+      this.nreg = data & 7;
+      this.lfsr = 1 << (this.width - 1);
+    }
+  }
+
+  _tick() {
+    const p = this.period;
+    for (let i = 0; i < 3; i++) {
+      if (--this.cnt[i] <= 0) {
+        this.cnt[i] = p[i] > 1 ? p[i] : 1;
+        this.out[i] ^= 1;
+      }
+    }
+    if (--this.ncnt <= 0) {
+      const nf = this.nreg & 3;
+      this.ncnt = nf === 3 ? (p[2] > 1 ? p[2] : 1) : (0x10 << nf);
+      this.nff ^= 1;
+      if (this.nff) {
+        let fb;
+        if (this.nreg & 4) {
+          let x = this.lfsr & this.fbMask;
+          x ^= x >> 8; x ^= x >> 4; x ^= x >> 2; x ^= x >> 1;
+          fb = x & 1;
+        } else {
+          fb = this.lfsr & 1;
+        }
+        this.lfsr = (this.lfsr >> 1) | (fb << (this.width - 1));
+      }
+    }
+  }
+
+  renderSample() {
+    this.acc += this.step;
+    while (this.acc >= 1) {
+      this.acc -= 1;
+      this._tick();
+      const st = this.stereo, v = this.vol, p = this.period;
+      let l = 0, r = 0;
+      for (let i = 0; i < 4; i++) {
+        let s;
+        if (i < 3) s = p[i] > 1 ? this.out[i] : 0.5;      // 周期 0/1 は超音波 → 平均値 (PCM 再生用)
+        else s = this.lfsr & 1;
+        s *= SN_LEVELS[v[i]];
+        if (st & (1 << i)) r += s;
+        if (st & (0x10 << i)) l += s;
+      }
+      this.prevL = this.curL; this.prevR = this.curR;
+      this.curL = this.filtL.process(l);
+      this.curR = this.filtR.process(r);
+    }
+    const mixL = (this.prevL + (this.curL - this.prevL) * this.acc) * SN_GAIN;
+    const mixR = (this.prevR + (this.curR - this.prevR) * this.acc) * SN_GAIN;
+    const k = this.dcCoef;
+    const oL = mixL - this.dprevL + k * this.dcL;
+    const oR = mixR - this.dprevR + k * this.dcR;
+    this.dprevL = mixL; this.dprevR = mixR;
+    this.dcL = oL; this.dcR = oR;
+    const o = this._o;
+    o[0] = oL; o[1] = oR;
+    return o;
+  }
+
+  // 表示用: 4ch の現在の音量 (0~1)
+  getLevels(out) {
+    for (let i = 0; i < 4; i++) {
+      out[i] = (i < 3 && this.period[i] <= 1) ? 0 : SN_LEVELS[this.vol[i]];
+    }
+    return out;
+  }
+}
+
+// =====================================================================
 //  メインスレッド用 VGM プレイヤー (ScriptProcessor)
 // =====================================================================
 class VGMPlayer {
@@ -1268,6 +1882,9 @@ class VGMPlayer {
     this.vgmRate = vgmSampleRate;
     this.chip2203 = null;
     this.chip2608 = null;
+    this.chip2612 = null;
+    this.chip2151 = null;
+    this.chipPSG = null;
     this.cfg = null;
     this.events = [];
     this.eventIndex = 0;
@@ -1286,6 +1903,9 @@ class VGMPlayer {
     this.onEnded = null;
     this.onLooped = null;
 
+    this._scope = new Float32Array(2048);                    // ビジュアライザ用のオシロ波形 (リングバッファ)
+    this._scopeIdx = 0;
+
     this.node = this.audioCtx.createScriptProcessor(8192, 0, 2);
     this.node.onaudioprocess = (e) => this._process(e);
   }
@@ -1298,6 +1918,16 @@ class VGMPlayer {
     this.chip2203 = c.ym2203Clock ? new OPNChip(2203, this.outRate, c.ym2203Clock) : null;
     this.chip2608 = c.ym2608Clock ? new OPNChip(2608, this.outRate, c.ym2608Clock) : null;
     if (this.chip2608 && c.adpcmRam) this.chip2608.setAdpcmRam(c.adpcmRam);
+    this.chip2612 = c.ym2612Clock ? new YM2612(this.outRate, c.ym2612Clock) : null;
+    this.chip2151 = c.ym2151Clock ? new YM2151(this.outRate, c.ym2151Clock) : null;
+    this.chipPSG = c.sn76489Clock ? new SN76489(this.outRate, c.sn76489Clock, c.snFeedback, c.snShiftWidth) : null;
+  }
+
+  // 最新のオシロ波形を時系列順に out へ書き出す
+  getScope(out) {
+    const n = this._scope.length, idx = this._scopeIdx;
+    for (let i = 0; i < out.length && i < n; i++) out[i] = this._scope[(idx + n - out.length + i) & (n - 1)];
+    return out;
   }
 
   load(vgmParser) {
@@ -1309,13 +1939,22 @@ class VGMPlayer {
 
     const h = vgmParser.header;
     let c2203 = h.ym2203Clock, c2608 = h.ym2608Clock;
-    if (!c2203 && !c2608) {                                   // ヘッダにクロックが無い場合はイベント種別から判断
-      const has2608 = this.events.some(e => e.type === 'ym2608');
-      const has2203 = this.events.some(e => e.type === 'ym2203');
+    let c2612 = h.ym2612Clock, c2151 = h.ym2151Clock, cSn = h.sn76489Clock;
+    const has = (t) => this.events.some(e => e.type === t);
+    if (!c2612 && has('ym2612')) c2612 = 7670454;             // ヘッダにクロックが無い場合はイベント種別から判断
+    if (!c2151 && has('ym2151')) c2151 = 3579545;
+    if (!cSn && has('sn76489')) cSn = 3579545;
+    if (!c2203 && !c2608 && !c2612 && !c2151 && !cSn) {
+      const has2608 = has('ym2608');
+      const has2203 = has('ym2203');
       if (has2608) c2608 = 7987200;
       if (has2203 || !has2608) c2203 = 3993600;
     }
-    this.cfg = { ym2203Clock: c2203, ym2608Clock: c2608, adpcmRam: vgmParser.adpcmRam };
+    this.cfg = {
+      ym2203Clock: c2203, ym2608Clock: c2608, ym2612Clock: c2612, ym2151Clock: c2151,
+      sn76489Clock: cSn, snFeedback: h.snFeedback, snShiftWidth: h.snShiftWidth,
+      adpcmRam: vgmParser.adpcmRam,
+    };
     this._createChips();
     this.ended = false;
     this.playing = false;
@@ -1336,6 +1975,14 @@ class VGMPlayer {
       if (this.chip2203) this.chip2203.write(0, ev.addr, ev.data);
     } else if (ev.type === 'ym2608') {
       if (this.chip2608) this.chip2608.write(ev.port, ev.addr, ev.data);
+    } else if (ev.type === 'ym2612') {
+      if (this.chip2612) this.chip2612.write(ev.port, ev.addr, ev.data);
+    } else if (ev.type === 'ym2151') {
+      if (this.chip2151) this.chip2151.write(ev.addr, ev.data);
+    } else if (ev.type === 'sn76489') {
+      if (this.chipPSG) this.chipPSG.write(ev.data);
+    } else if (ev.type === 'psgstereo') {
+      if (this.chipPSG) this.chipPSG.setStereo(ev.data);
     }
   }
 
@@ -1356,6 +2003,9 @@ class VGMPlayer {
     let l = 0, r = 0;
     if (this.chip2203) { const s = this.chip2203.renderSample(); l += s[0]; r += s[1]; }
     if (this.chip2608) { const s = this.chip2608.renderSample(); l += s[0]; r += s[1]; }
+    if (this.chip2612) { const s = this.chip2612.renderSample(); l += s[0]; r += s[1]; }
+    if (this.chip2151) { const s = this.chip2151.renderSample(); l += s[0]; r += s[1]; }
+    if (this.chipPSG) { const s = this.chipPSG.renderSample(); l += s[0]; r += s[1]; }
     return [l, r];
   }
 
@@ -1399,6 +2049,8 @@ class VGMPlayer {
       if (!s) { left[i] = 0; right[i] = 0; continue; }
       left[i] = softOut(s[0]);
       right[i] = softOut(s[1]);
+      this._scope[this._scopeIdx] = (left[i] + right[i]) * 0.5;
+      this._scopeIdx = (this._scopeIdx + 1) & 2047;
     }
 
     this._posCounter += left.length;
@@ -1420,7 +2072,7 @@ function softOut(x) {
 }
 
 if (typeof module !== 'undefined') {
-  module.exports = { VGMParser, OPNChip, YM2203, YM2608, VGMPlayer };
+  module.exports = { VGMParser, OPNChip, YM2203, YM2608, YM2612, YM2151, SN76489, VGMPlayer };
 }
 
 </script>
@@ -1519,8 +2171,12 @@ async function loadFile(file) {
     state.vgm = parser;
     state.totalSamples = parser.totalSamples;
 
-    if (!parser.header.ym2203Clock) {
-      setStatus('警告: このVGMにYM2203データが見つかりません。無音になる可能性があります。');
+    const hd = parser.header;
+    const evHas = (...ts) => parser.events.some(e => ts.includes(e.type));
+    const hasOPN = !!(hd.ym2203Clock || hd.ym2608Clock || evHas('ym2203', 'ym2608'));
+    const hasOther = !!(hd.ym2612Clock || hd.ym2151Clock || hd.sn76489Clock || evHas('ym2612', 'ym2151', 'sn76489'));
+    if (!hasOPN && !hasOther) {
+      setStatus('警告: 対応する音源 (YM2203/2608/2612/2151, SN76489) のデータが見つかりません。無音になる可能性があります。');
     } else {
       setStatus(`読み込み完了: ${file.name}`);
     }
@@ -1537,7 +2193,13 @@ async function loadFile(file) {
     player.play();
     state.player = player;
     state.playing = true;
-    fmdspVis.attach(player, parser, file.name);
+    if (hasOPN || !hasOther) {                  // PC-98 (OPN 系) は FMDSP 画面
+      chipVis.detach();
+      fmdspVis.attach(player, parser, file.name);
+    } else {                                    // X68000 (OPM) / メガドライブ (OPN2 + PSG) 用の表示
+      fmdspVis.suspend();
+      chipVis.attach(player, parser, file.name);
+    }
 
     state.loaded = true;
    
@@ -1874,6 +2536,7 @@ class FmdspVisualizer {
     this.ready = this._init();
     this.player = null;
     this.running = false;
+    this.active = true;
     this.style = 0; this.palette = 0;
     this.lastFrame = 0; this.fpsCount = 0; this.fpsT = 0; this.fps = 0; this.cpuAcc = 0;
     canvas.addEventListener('click', (e) => this.cycle(e.shiftKey));
@@ -1903,9 +2566,12 @@ class FmdspVisualizer {
     w.vis_set_filename();
   }
 
+  suspend() { this.active = false; this.player = null; }
+
   // VGM を読み込んだら呼ぶ
   async attach(player, parser, filename) {
     await this.ready;
+    this.active = true;
     const w = this.w, h = parser.header;
     const use2608 = !!h.ym2608Clock || (!h.ym2203Clock && parser.events.some(e => e.type === 'ym2608'));
     const chipType = use2608 ? 'ym2608' : 'ym2203';
@@ -1996,6 +2662,7 @@ class FmdspVisualizer {
 
   _loop(now) {
     requestAnimationFrame(this._loop);
+    if (!this.active) return;
     if (now - this.lastFrame < 15) return;      // 約60fps上限
     this.lastFrame = now;
     const w = this.w;
@@ -2030,7 +2697,154 @@ class FmdspVisualizer {
   }
 }
 
+// =====================================================================
+//  X68000 (YM2151) / メガドライブ (YM2612 + SN76489) 用ビジュアライザ
+//   チャンネルごとのレベルメーターとオシロスコープを同じキャンバスに描画する
+// =====================================================================
+class ChipVisualizer {
+  constructor(canvas) {
+    this.canvas = canvas;
+    this.ctx = canvas.getContext('2d');
+    this.active = false;
+    this.player = null;
+    this.parser = null;
+    this.title = ''; this.sub = ''; this.info = '';
+    this.bars = [];                           // { label, color, get() }
+    this.disp = [];
+    this.scope = new Float32Array(1024);
+    this.psgLv = new Float64Array(4);
+    this.theme = 0;
+    this.themes = [
+      { bg: '#0b0f14', fg: '#d6dde6', dim: '#5b6675', grid: '#1b2430', opm: '#ff9d2e', opn2: '#4fc3f7', psg: '#7be08a' },
+      { bg: '#000000', fg: '#ffffff', dim: '#777777', grid: '#222222', opm: '#ff5555', opn2: '#55ffff', psg: '#55ff55' },
+      { bg: '#14101f', fg: '#e8e0ff', dim: '#7a6f99', grid: '#2a2140', opm: '#ff7ad9', opn2: '#8fa2ff', psg: '#ffd966' },
+    ];
+    canvas.addEventListener('click', () => { if (this.active) this.theme = (this.theme + 1) % this.themes.length; });
+    this._loop = this._loop.bind(this);
+    requestAnimationFrame(this._loop);
+  }
+
+  detach() { this.active = false; this.player = null; }
+
+  attach(player, parser, filename) {
+    this.player = player;
+    this.parser = parser;
+    const g = parser.gd3;
+    this.title = (g && (g.trackNameEn || g.trackNameJp)) || filename.replace(/\.[^.]+$/, '');
+    this.sub = g ? [g.gameNameEn || g.gameNameJp, g.systemNameEn || g.systemNameJp].filter(Boolean).join('  /  ') : '';
+    this.author = (g && (g.authorEn || g.authorJp)) || '';
+    const infos = [];
+    this.bars = [];
+    const c2151 = player.chip2151, c2612 = player.chip2612, psg = player.chipPSG;
+    if (c2151) {
+      infos.push(`YM2151 ${(c2151.clock / 1e6).toFixed(4)}MHz`);
+      for (let i = 0; i < 8; i++) this.bars.push({ label: 'FM' + (i + 1), chip: 'opm', get: () => c2151.levels[i] / 8176 });
+    }
+    if (c2612) {
+      infos.push(`YM2612 ${(c2612.clock / 1e6).toFixed(4)}MHz`);
+      for (let i = 0; i < 6; i++) {
+        this.bars.push({
+          label: i === 5 ? 'F6/DA' : 'FM' + (i + 1), chip: 'opn2',
+          get: () => c2612.levels[i] / 8176,
+        });
+      }
+    }
+    if (psg) {
+      infos.push(`SN76489 ${(psg.clock / 1e6).toFixed(4)}MHz`);
+      const names = ['PSG1', 'PSG2', 'PSG3', 'NOISE'];
+      for (let i = 0; i < 4; i++) {
+        this.bars.push({ label: names[i], chip: 'psg', get: () => { psg.getLevels(this.psgLv); return this.psgLv[i]; } });
+      }
+    }
+    this.info = infos.join('  +  ');
+    this.disp = new Array(this.bars.length).fill(0);
+    this.active = true;
+  }
+
+  _fmtTime(samples) {
+    const s = Math.max(0, Math.floor(samples / 44100));
+    return String(Math.floor(s / 60)).padStart(2, '0') + ':' + String(s % 60).padStart(2, '0');
+  }
+
+  _text(str, x, y, color, size, align) {
+    const c = this.ctx;
+    c.font = `${size}px "MS Gothic", "Osaka-Mono", "Noto Sans Mono CJK JP", monospace`;
+    c.fillStyle = color;
+    c.textAlign = align || 'left';
+    c.textBaseline = 'alphabetic';
+    c.fillText(str, x, y);
+  }
+
+  _loop() {
+    requestAnimationFrame(this._loop);
+    if (!this.active || !this.player) return;
+    const c = this.ctx, W = this.canvas.width, H = this.canvas.height;
+    const th = this.themes[this.theme];
+    const pl = this.player;
+
+    c.fillStyle = th.bg;
+    c.fillRect(0, 0, W, H);
+
+    // ---- ヘッダ ----
+    this._text(this.title.slice(0, 44), 20, 36, th.fg, 22);
+    if (this.sub) this._text(this.sub.slice(0, 60), 20, 62, th.dim, 15);
+    if (this.author) this._text(this.author.slice(0, 60), 20, 82, th.dim, 15);
+    this._text(this.info, 20, 108, th.dim, 14);
+    const pos = Math.min(pl.currentSample, this.parser.totalSamples || pl.currentSample);
+    this._text(`${this._fmtTime(pos)} / ${this._fmtTime(this.parser.totalSamples)}`, W - 20, 36, th.fg, 20, 'right');
+    this._text(pl.ended ? 'END' : pl.playing ? (pl.loopEnabled ? 'PLAY  LOOP' : 'PLAY') : 'PAUSE', W - 20, 62, th.dim, 15, 'right');
+
+    // ---- レベルメーター ----
+    const n = this.bars.length;
+    const top = 126, bottom = 282, segs = 20;
+    const gap = 6;
+    const barW = Math.max(14, Math.min(44, Math.floor((W - 40 - gap * (n - 1)) / Math.max(1, n))));
+    const total = n * barW + (n - 1) * gap;
+    let x = Math.floor((W - total) / 2);
+    const segH = (bottom - top) / segs;
+    for (let i = 0; i < n; i++) {
+      const b = this.bars[i];
+      let v = Math.sqrt(Math.min(1, Math.max(0, b.get())));
+      this.disp[i] = v > this.disp[i] ? v : this.disp[i] * 0.9;
+      const lit = Math.round(this.disp[i] * segs);
+      const col = th[b.chip];
+      for (let s = 0; s < segs; s++) {
+        const y = bottom - (s + 1) * segH + 1;
+        c.globalAlpha = s < lit ? (s > segs - 4 ? 1 : 0.9) : 0.14;
+        c.fillStyle = col;
+        c.fillRect(x, y, barW, segH - 2);
+      }
+      c.globalAlpha = 1;
+      this._text(b.label, x + barW / 2, bottom + 18, th.dim, barW < 30 ? 10 : 12, 'center');
+      x += barW + gap;
+    }
+
+    // ---- オシロスコープ ----
+    const sy = 322, sh = 64, sx = 20, sw = W - 40;
+    c.strokeStyle = th.grid;
+    c.lineWidth = 1;
+    c.strokeRect(sx + 0.5, sy + 0.5, sw, sh);
+    c.beginPath(); c.moveTo(sx, sy + sh / 2 + 0.5); c.lineTo(sx + sw, sy + sh / 2 + 0.5); c.stroke();
+    const buf = pl.getScope(this.scope);
+    let start = 0;                                     // 立ち上がりのゼロクロスから描いて波形を安定させる
+    for (let i = 1; i < 512; i++) { if (buf[i - 1] < 0 && buf[i] >= 0) { start = i; break; } }
+    c.beginPath();
+    c.strokeStyle = th[this.bars.length ? this.bars[0].chip : 'opm'];
+    c.lineWidth = 1.5;
+    const len = 512;
+    for (let i = 0; i < len; i++) {
+      const px = sx + (i / (len - 1)) * sw;
+      const v = Math.max(-1, Math.min(1, buf[start + i] * 2.5));
+      const py = sy + sh / 2 - v * (sh / 2 - 3);
+      if (i === 0) c.moveTo(px, py); else c.lineTo(px, py);
+    }
+    c.stroke();
+    this._text('クリック: 配色切替', W - 20, H - 6, th.dim, 11, 'right');
+  }
+}
+
 const fmdspVis = new FmdspVisualizer(document.getElementById('fmdspCanvas'));
+const chipVis = new ChipVisualizer(document.getElementById('fmdspCanvas'));
 fmdspVis.ready.catch(err => { console.error(err); setStatus && setStatus('FMDSP初期化エラー: ' + err.message); });
 </script>
 
