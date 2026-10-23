@@ -86,6 +86,15 @@ class VGMParser {
       if (h.dataOffset >= 0x34) h.ym2151Clock = this._readU32(0x30) & 0x3fffffff;
     }
 
+    // OKIM6258 / MSM6258 (X68000 ADPCM): クロック 0x90, フラグ 0x94
+    //   フラグ bit0-1: 分周 (0=1024, 1=768, 2/3=512), bit2: 3bit ADPCM, bit3: 出力 12bit (0 なら 10bit)
+    h.msm6258Clock = 0;
+    h.msm6258Flags = 0;
+    if (h.version >= 0x161 && h.dataOffset >= 0x98 && this.buf.length >= 0x98) {
+      h.msm6258Clock = this._readU32(0x90) & 0x3fffffff;
+      h.msm6258Flags = this.buf[0x94];
+    }
+
     this.totalSamples = h.totalSamples;
     this.loopByteOffset = h.loopOffset ? h.loopOffset + 0x1c : -1;
 
@@ -142,6 +151,9 @@ class VGMParser {
     // YM2612 PCM データバンク (データブロック type 0x00) と DAC ストリーム
     let bank = new Uint8Array(0);
     const blocks = [];
+    let msmBank = new Uint8Array(0);                 // OKIM6258 ADPCM データバンク (データブロック type 0x04)
+    const msmBlocks = [];
+    const MSM_CHIP = 0x17;                           // DAC ストリームのチップ種別: OKIM6258
     let pcmPos = 0;
     const streams = {};
     let usedStreams = false;
@@ -153,13 +165,16 @@ class VGMParser {
         const s = streams[id];
         if (!s.active || s.freq <= 0) continue;
         const interval = 44100 / s.freq;
+        const isMsm = s.chip === MSM_CHIP;
+        const bk = isMsm ? msmBank : bank;
         let guard = 0;
         while (s.active && s.nextT < target && guard++ < 4000000) {
-          if (s.pos < 0 || s.pos >= bank.length) {
-            if (s.loop && s.len !== 0 && s.startPos < bank.length) { s.pos = s.startPos; s.remaining = s.len; }
+          if (s.pos < 0 || s.pos >= bk.length) {
+            if (s.loop && s.len !== 0 && s.startPos < bk.length) { s.pos = s.startPos; s.remaining = s.len; }
             else { s.active = false; break; }
           }
-          events.push({ sampleOffset: s.nextT, type: 'ym2612', port: s.port, addr: s.reg, data: bank[s.pos] });
+          if (isMsm) events.push({ sampleOffset: s.nextT, type: 'msm6258', addr: s.reg & 0x7f, data: bk[s.pos] });
+          else events.push({ sampleOffset: s.nextT, type: 'ym2612', port: s.port, addr: s.reg, data: bk[s.pos] });
           usedStreams = true;
           s.pos += s.step;
           s.nextT += interval;
@@ -192,6 +207,11 @@ class VGMParser {
         p += 3;
       } else if (cmd === 0x54) {                         // YM2151 (X68000)
         events.push({ sampleOffset, type: 'ym2151', addr: buf[p + 1], data: buf[p + 2] });
+        p += 3;
+      } else if (cmd === 0xb7) {                         // OKIM6258 / MSM6258 (X68000 ADPCM): aa dd
+        if (!(buf[p + 1] & 0x80)) {                      // bit7 = 2 個目のチップ (非対応なので無視)
+          events.push({ sampleOffset, type: 'msm6258', addr: buf[p + 1] & 0x7f, data: buf[p + 2] });
+        }
         p += 3;
       } else if (cmd === 0x50) {                         // SN76489 (メガドライブ PSG)
         events.push({ sampleOffset, type: 'sn76489', data: buf[p + 1] });
@@ -226,6 +246,13 @@ class VGMParser {
           nb.set(bank); nb.set(chunk, bank.length);
           blocks.push({ start: bank.length, len: chunk.length });
           bank = nb;
+        } else if (dataType === 0x04) {
+          // OKIM6258 ADPCM データ (DAC ストリームから参照される)
+          const chunk = buf.subarray(p + 7, Math.min(buf.length, p + 7 + size));
+          const nb = new Uint8Array(msmBank.length + chunk.length);
+          nb.set(msmBank); nb.set(chunk, msmBank.length);
+          msmBlocks.push({ start: msmBank.length, len: chunk.length });
+          msmBank = nb;
         } else if (dataType === 0x81) {
           // YM2608 DELTA-T ROM: [全体サイズ(4)] [開始アドレス(4)] [データ...]
           const romSize = this._readU32(p + 7);
@@ -274,11 +301,11 @@ class VGMParser {
           const m = mode & 0x0f;
           if (m === 1) s.len = len;
           else if (m === 2) s.len = Math.floor(len * s.freq / 1000);
-          else if (m === 3) s.len = Math.max(0, Math.floor((bank.length - s.pos) / s.step));
+          else if (m === 3) s.len = Math.max(0, Math.floor(((s.chip === MSM_CHIP ? msmBank : bank).length - s.pos) / s.step));
           else s.len = -1;
           s.remaining = s.len;
           s.nextT = sampleOffset;
-          s.active = (s.chip === 0x02);                  // YM2612 のみ対応
+          s.active = (s.chip === 0x02 || s.chip === MSM_CHIP);   // YM2612 / OKIM6258 に対応
         }
         p += 11;
       } else if (cmd === 0x94) {                         // ストリーム停止
@@ -287,14 +314,14 @@ class VGMParser {
         p += 2;
       } else if (cmd === 0x95) {                         // ブロック ID 指定で開始: ss bbbb ff
         const s = streams[buf[p + 1]];
-        const blk = blocks[this._readU16(p + 2)];
+        const blk = (s && s.chip === MSM_CHIP ? msmBlocks : blocks)[this._readU16(p + 2)];
         if (s && blk) {
           s.pos = blk.start; s.startPos = blk.start;
           s.len = Math.floor(blk.len / s.step);
           s.remaining = s.len;
           s.loop = (buf[p + 4] & 1) !== 0;
           s.nextT = sampleOffset;
-          s.active = (s.chip === 0x02);
+          s.active = (s.chip === 0x02 || s.chip === MSM_CHIP);
         }
         p += 5;
       } else if (cmd >= 0xc0 && cmd <= 0xdf) {
@@ -1742,6 +1769,141 @@ class YM2151 {
 }
 
 // =====================================================================
+//  MSM6258 / OKIM6258 (X68000 の ADPCM = PCM 音源)
+//   4bit OKI ADPCM → 12bit PCM。サンプリング周波数 = クロック / 分周 (X68000: 3.9k/5.2k/7.8k/10.4k/15.6kHz)
+//   データは 1 バイト = 2 サンプル (下位ニブルが先)
+// =====================================================================
+const MSM_INDEX_SHIFT = [-1, -1, -1, -1, 2, 4, 6, 8];
+const MSM_DIFF = (() => {
+  const t = new Int16Array(49 * 16);
+  for (let st = 0; st < 49; st++) {
+    const sv = Math.floor(16 * Math.pow(1.1, st));
+    for (let n = 0; n < 16; n++) {
+      const d = (sv >> 3) + ((n & 1) ? (sv >> 2) : 0) + ((n & 2) ? (sv >> 1) : 0) + ((n & 4) ? sv : 0);
+      t[st * 16 + n] = (n & 8) ? -d : d;
+    }
+  }
+  return t;
+})();
+const MSM_DIVIDERS = [1024, 768, 512, 512];
+const MSM_GAIN = 1.8 / 32768;                       // フルスケール(±32768) ≒ ±0.3 (FM とのバランス用。ピーク余裕を確保)
+const MSM_FIFO = 1024;
+
+class MSM6258 {
+  constructor(outRate, clock, flags) {
+    this.outRate = outRate;
+    this.clock = clock || 8000000;
+    flags = flags | 0;
+    this.divIdx = flags & 3;
+    this.out12 = !!(flags & 8);                     // false: 10bit 出力 (X68000 実機)
+    this.clockBytes = [this.clock & 255, (this.clock >> 8) & 255, (this.clock >> 16) & 255, (this.clock >>> 24) & 255];
+
+    this.fifo = new Uint8Array(MSM_FIFO);
+    this.fRead = 0; this.fWrite = 0; this.fCount = 0;
+    this.mute = false;                              // true の間はデータ書き込みを捨てる (シーク時の追い込み用)
+    this.playing = false;
+    this.signal = -2; this.stepIdx = 0; this.shift = 0;
+    this.panL = true; this.panR = true;
+
+    this.prev = 0; this.cur = 0; this.acc = 0;
+    this.filtL = [new Biquad(), new Biquad()];
+    this.filtR = [new Biquad(), new Biquad()];
+    this.dcCoef = Math.pow(0.9995, 44100 / outRate);
+    this.dcL = 0; this.dcR = 0; this.dprevL = 0; this.dprevR = 0;
+    this.level = 0;                                 // 表示用 (0~1)
+    this._o = [0, 0];
+    this._updateRate();
+  }
+
+  _updateRate() {
+    this.chipRate = this.clock / MSM_DIVIDERS[this.divIdx];
+    this.step = this.chipRate / this.outRate;
+    const fc = Math.min(this.chipRate * 0.45, this.outRate * 0.45);   // 補間のイメージ成分を除去 (4次バターワース)
+    const qs = [0.5412, 1.3066];
+    for (let i = 0; i < 2; i++) {
+      this.filtL[i].setLowpass(this.outRate, fc, qs[i]);
+      this.filtR[i].setLowpass(this.outRate, fc, qs[i]);
+    }
+  }
+
+  write(addr, data) {
+    data &= 0xff;
+    switch (addr & 0x7f) {
+      case 0x00:                                    // コマンド: bit0=停止, bit1=再生開始
+        if (data & 1) this.playing = false;
+        else if (data & 2) {
+          if (!this.playing) { this.playing = true; this.signal = -2; this.stepIdx = 0; this.shift = 0; }
+        }
+        break;
+      case 0x01:                                    // ADPCM データ
+        if (!this.mute && this.fCount < MSM_FIFO) {
+          this.fifo[this.fWrite] = data;
+          this.fWrite = (this.fWrite + 1) & (MSM_FIFO - 1);
+          this.fCount++;
+        }
+        break;
+      case 0x02:                                    // パン (X68000 PPI): bit0=左ミュート, bit1=右ミュート
+        this.panL = !(data & 1);
+        this.panR = !(data & 2);
+        break;
+      case 0x08:                                    // 分周設定
+        this.divIdx = data & 3;
+        this._updateRate();
+        break;
+      case 0x09: case 0x0a: case 0x0b: case 0x0c: { // マスタークロック (下位バイトから、0x0c で確定)
+        this.clockBytes[(addr & 0x7f) - 9] = data;
+        if ((addr & 0x7f) === 0x0c) {
+          const c = (this.clockBytes[0] | (this.clockBytes[1] << 8) | (this.clockBytes[2] << 16) | (this.clockBytes[3] << 24)) >>> 0;
+          if (c) { this.clock = c; this._updateRate(); }
+        }
+        break;
+      }
+      default: break;
+    }
+  }
+
+  // ADPCM チップ 1 サンプル分を進める (戻り値: ±32768 のリニア PCM)
+  _tick() {
+    if (!this.playing) return 0;
+    if (this.fCount > 0) {
+      const nib = (this.fifo[this.fRead] >> this.shift) & 15;
+      this.shift ^= 4;
+      if (this.shift === 0) { this.fRead = (this.fRead + 1) & (MSM_FIFO - 1); this.fCount--; }
+      let sg = this.signal + MSM_DIFF[this.stepIdx * 16 + nib];
+      this.signal = sg > 2047 ? 2047 : sg < -2048 ? -2048 : sg;
+      let st = this.stepIdx + MSM_INDEX_SHIFT[nib & 7];
+      this.stepIdx = st > 48 ? 48 : st < 0 ? 0 : st;
+    }
+    return this.out12 ? (this.signal << 4) : ((this.signal & ~3) << 4);
+  }
+
+  renderSample() {
+    this.acc += this.step;
+    while (this.acc >= 1) {
+      this.acc -= 1;
+      this.prev = this.cur;
+      this.cur = this._tick();
+    }
+    const v = this.prev + (this.cur - this.prev) * this.acc;      // 線形補間
+    const a = v < 0 ? -v : v;
+    const lv = a / 32768;
+    this.level = lv > this.level ? lv : this.level * 0.99998;
+
+    let l = this.panL ? v : 0, r = this.panR ? v : 0;
+    l = this.filtL[1].process(this.filtL[0].process(l)) * MSM_GAIN;
+    r = this.filtR[1].process(this.filtR[0].process(r)) * MSM_GAIN;
+    const k = this.dcCoef;
+    const oL = l - this.dprevL + k * this.dcL;
+    const oR = r - this.dprevR + k * this.dcR;
+    this.dprevL = l; this.dprevR = r;
+    this.dcL = oL; this.dcR = oR;
+    const o = this._o;
+    o[0] = oL; o[1] = oR;
+    return o;
+  }
+}
+
+// =====================================================================
 //  SN76489 (メガドライブ PSG)  矩形波 3ch + ノイズ 1ch
 // =====================================================================
 const SN_LEVELS = (() => {
@@ -1885,6 +2047,7 @@ class VGMPlayer {
     this.chip2612 = null;
     this.chip2151 = null;
     this.chipPSG = null;
+    this.chipMsm = null;
     this.cfg = null;
     this.events = [];
     this.eventIndex = 0;
@@ -1921,6 +2084,7 @@ class VGMPlayer {
     this.chip2612 = c.ym2612Clock ? new YM2612(this.outRate, c.ym2612Clock) : null;
     this.chip2151 = c.ym2151Clock ? new YM2151(this.outRate, c.ym2151Clock) : null;
     this.chipPSG = c.sn76489Clock ? new SN76489(this.outRate, c.sn76489Clock, c.snFeedback, c.snShiftWidth) : null;
+    this.chipMsm = c.msm6258Clock ? new MSM6258(this.outRate, c.msm6258Clock, c.msm6258Flags) : null;
   }
 
   // 最新のオシロ波形を時系列順に out へ書き出す
@@ -1939,12 +2103,13 @@ class VGMPlayer {
 
     const h = vgmParser.header;
     let c2203 = h.ym2203Clock, c2608 = h.ym2608Clock;
-    let c2612 = h.ym2612Clock, c2151 = h.ym2151Clock, cSn = h.sn76489Clock;
+    let c2612 = h.ym2612Clock, c2151 = h.ym2151Clock, cSn = h.sn76489Clock, cMsm = h.msm6258Clock;
     const has = (t) => this.events.some(e => e.type === t);
     if (!c2612 && has('ym2612')) c2612 = 7670454;             // ヘッダにクロックが無い場合はイベント種別から判断
     if (!c2151 && has('ym2151')) c2151 = 3579545;
     if (!cSn && has('sn76489')) cSn = 3579545;
-    if (!c2203 && !c2608 && !c2612 && !c2151 && !cSn) {
+    if (!cMsm && has('msm6258')) cMsm = 8000000;             // X68000 標準 (8MHz)
+    if (!c2203 && !c2608 && !c2612 && !c2151 && !cSn && !cMsm) {
       const has2608 = has('ym2608');
       const has2203 = has('ym2203');
       if (has2608) c2608 = 7987200;
@@ -1953,6 +2118,7 @@ class VGMPlayer {
     this.cfg = {
       ym2203Clock: c2203, ym2608Clock: c2608, ym2612Clock: c2612, ym2151Clock: c2151,
       sn76489Clock: cSn, snFeedback: h.snFeedback, snShiftWidth: h.snShiftWidth,
+      msm6258Clock: cMsm, msm6258Flags: h.msm6258Flags | 0,
       adpcmRam: vgmParser.adpcmRam,
     };
     this._createChips();
@@ -1983,16 +2149,20 @@ class VGMPlayer {
       if (this.chipPSG) this.chipPSG.write(ev.data);
     } else if (ev.type === 'psgstereo') {
       if (this.chipPSG) this.chipPSG.setStereo(ev.data);
+    } else if (ev.type === 'msm6258') {
+      if (this.chipMsm) this.chipMsm.write(ev.addr, ev.data);
     }
   }
 
   seekSample(targetSample) {
     this._createChips();
+    if (this.chipMsm) this.chipMsm.mute = true;              // シーク中の ADPCM データは FIFO に溜めない
     let i = 0;
     while (i < this.events.length && this.events[i].sampleOffset <= targetSample) {
       this._dispatch(this.events[i]);
       i++;
     }
+    if (this.chipMsm) this.chipMsm.mute = false;
     this.eventIndex = i;
     this.currentSample = targetSample;
   }
@@ -2006,6 +2176,7 @@ class VGMPlayer {
     if (this.chip2612) { const s = this.chip2612.renderSample(); l += s[0]; r += s[1]; }
     if (this.chip2151) { const s = this.chip2151.renderSample(); l += s[0]; r += s[1]; }
     if (this.chipPSG) { const s = this.chipPSG.renderSample(); l += s[0]; r += s[1]; }
+    if (this.chipMsm) { const s = this.chipMsm.renderSample(); l += s[0]; r += s[1]; }
     return [l, r];
   }
 
@@ -2072,7 +2243,7 @@ function softOut(x) {
 }
 
 if (typeof module !== 'undefined') {
-  module.exports = { VGMParser, OPNChip, YM2203, YM2608, YM2612, YM2151, SN76489, VGMPlayer };
+  module.exports = { VGMParser, OPNChip, YM2203, YM2608, YM2612, YM2151, SN76489, MSM6258, VGMPlayer };
 }
 
 </script>
@@ -2174,9 +2345,9 @@ async function loadFile(file) {
     const hd = parser.header;
     const evHas = (...ts) => parser.events.some(e => ts.includes(e.type));
     const hasOPN = !!(hd.ym2203Clock || hd.ym2608Clock || evHas('ym2203', 'ym2608'));
-    const hasOther = !!(hd.ym2612Clock || hd.ym2151Clock || hd.sn76489Clock || evHas('ym2612', 'ym2151', 'sn76489'));
+    const hasOther = !!(hd.ym2612Clock || hd.ym2151Clock || hd.sn76489Clock || hd.msm6258Clock || evHas('ym2612', 'ym2151', 'sn76489', 'msm6258'));
     if (!hasOPN && !hasOther) {
-      setStatus('警告: 対応する音源 (YM2203/2608/2612/2151, SN76489) のデータが見つかりません。無音になる可能性があります。');
+      setStatus('警告: 対応する音源 (YM2203/2608/2612/2151, SN76489, MSM6258) のデータが見つかりません。無音になる可能性があります。');
     } else {
       setStatus(`読み込み完了: ${file.name}`);
     }
@@ -2715,9 +2886,9 @@ class ChipVisualizer {
     this.psgLv = new Float64Array(4);
     this.theme = 0;
     this.themes = [
-      { bg: '#0b0f14', fg: '#d6dde6', dim: '#5b6675', grid: '#1b2430', opm: '#ff9d2e', opn2: '#4fc3f7', psg: '#7be08a' },
-      { bg: '#000000', fg: '#ffffff', dim: '#777777', grid: '#222222', opm: '#ff5555', opn2: '#55ffff', psg: '#55ff55' },
-      { bg: '#14101f', fg: '#e8e0ff', dim: '#7a6f99', grid: '#2a2140', opm: '#ff7ad9', opn2: '#8fa2ff', psg: '#ffd966' },
+      { bg: '#0b0f14', fg: '#d6dde6', dim: '#5b6675', grid: '#1b2430', opm: '#ff9d2e', opn2: '#4fc3f7', psg: '#7be08a', pcm: '#e86bff' },
+      { bg: '#000000', fg: '#ffffff', dim: '#777777', grid: '#222222', opm: '#ff5555', opn2: '#55ffff', psg: '#55ff55', pcm: '#ffff55' },
+      { bg: '#14101f', fg: '#e8e0ff', dim: '#7a6f99', grid: '#2a2140', opm: '#ff7ad9', opn2: '#8fa2ff', psg: '#ffd966', pcm: '#5ef0c0' },
     ];
     canvas.addEventListener('click', () => { if (this.active) this.theme = (this.theme + 1) % this.themes.length; });
     this._loop = this._loop.bind(this);
@@ -2735,10 +2906,14 @@ class ChipVisualizer {
     this.author = (g && (g.authorEn || g.authorJp)) || '';
     const infos = [];
     this.bars = [];
-    const c2151 = player.chip2151, c2612 = player.chip2612, psg = player.chipPSG;
+    const c2151 = player.chip2151, c2612 = player.chip2612, psg = player.chipPSG, msm = player.chipMsm;
     if (c2151) {
       infos.push(`YM2151 ${(c2151.clock / 1e6).toFixed(4)}MHz`);
       for (let i = 0; i < 8; i++) this.bars.push({ label: 'FM' + (i + 1), chip: 'opm', get: () => c2151.levels[i] / 8176 });
+    }
+    if (msm) {
+      infos.push(`MSM6258 ${(msm.clock / 1e6).toFixed(4)}MHz`);
+      this.bars.push({ label: 'ADPCM', chip: 'pcm', get: () => msm.level });
     }
     if (c2612) {
       infos.push(`YM2612 ${(c2612.clock / 1e6).toFixed(4)}MHz`);
