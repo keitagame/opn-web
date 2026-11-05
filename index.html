@@ -2670,13 +2670,11 @@ async function loadFile(file) {
     player.play();
     state.player = player;
     state.playing = true;
-    if (hasOPN || !hasOther) {                  // PC-98 (OPN 系) は FMDSP 画面
-      chipVis.detach();
-      fmdspVis.attach(player, parser, file.name);
-    } else {                                    // X68000 (OPM) / メガドライブ (OPN2 + PSG) / PC エンジン (HuC6280) 用の表示
-      fmdspVis.suspend();
-      chipVis.attach(player, parser, file.name);
-    }
+    // すべてのチップを FMDSP 画面で表示する
+    //   PC-98 (OPN 系) はそのまま、X68000 (OPM) / メガドライブ (OPN2 + PSG) / PC エンジン (HuC6280) などは
+    //   仮想 OPNA のレジスタ書き込みへ変換して流し込む (OpnaTranslator)
+    chipVis.detach();
+    fmdspVis.attach(player, parser, file.name);
 
     scopeVis.attach(player);
     state.loaded = true;
@@ -3008,6 +3006,397 @@ const FMDSP_WASM_B64 = "AGFzbQEAAAABqwEbYAN/f38Bf2ADf35/AX5gAn9/AX9gAX8Bf2AEf35/
 
 let viewMode = 'main';   // 'main' = FMDSP / チップ別メーター, 'scope' = オシロスコープ
 
+// =====================================================================
+//  各種チップのレジスタ書き込みを「仮想 OPNA (YM2608)」へ変換する
+//   FMDSP (libopna) は OPNA しか持たないので、YM2612 / YM2151 / SN76489 / HuC6280 / MSM6258 を
+//   OPNA のレジスタ書き込みへ置き換えて、同じ FMDSP 画面に表示する。
+//   音は VGMPlayer が鳴らすので、ここでの変換は「表示 (鍵盤・音量・メーター)」のためのもの
+//     YM2612   → FM1-6 へそのまま (レジスタ互換。DAC は ADPCM 表示へ)
+//     YM2151   → FM1-6 (レジスタ変換) / CH7・CH8 は SSG A・B へ簡易表示 (OPNA の FM は 6ch のため)
+//     SN76489  → SSG (トーン3ch + ノイズは SSG C を借りる)
+//     HuC6280  → FM1-6 (1 オペレータの正弦波音色で代用)
+//     MSM6258  → ADPCM
+// =====================================================================
+class OpnaTranslator {
+  // OPN 系 (YM2203/2608) 以外で、変換できるチップが含まれているか
+  static canTranslate(parser) {
+    const f = OpnaTranslator._scan(parser);
+    return f.opn2 || f.opm || f.huc || f.sn || f.msm;
+  }
+
+  static _scan(parser) {
+    const h = parser.header, types = new Set();
+    for (const e of parser.events) types.add(e.type);
+    return {
+      opn2: !!(h.ym2612Clock || types.has('ym2612')),
+      opm: !!(h.ym2151Clock || types.has('ym2151')),
+      huc: !!(h.huc6280Clock || types.has('huc6280')),
+      sn: !!(h.sn76489Clock || types.has('sn76489')),
+      msm: !!(h.msm6258Clock || types.has('msm6258')),
+    };
+  }
+
+  // 変換結果: { clock, T, K, P, A, D } (K=1 は終端)
+  static convert(parser) { return new OpnaTranslator(parser)._run(); }
+
+  constructor(parser) {
+    this.parser = parser;
+    const h = this.h = parser.header;
+    const f = OpnaTranslator._scan(parser);
+    // FM を表示するチップは 1 種類だけ (YM2612 > YM2151 > HuC6280 の優先)
+    this.useOPN2 = f.opn2;
+    this.useOPM = !f.opn2 && f.opm;
+    this.useHuC = !f.opn2 && !f.opm && f.huc;
+    this.useSN = f.sn;
+    this.useMSM = f.msm;
+
+    // 仮想 OPNA のマスタークロック。YM2612 はそのまま通すので同じクロックにする
+    this.clock = f.opn2 ? (h.ym2612Clock || 7670454) : 7987200;
+    this.fmRate = this.clock / 144;          // FM のサンプリングレート
+    this.ssgClk = this.clock / 4;            // SSG へ入るクロック
+
+    this.T = []; this.K = []; this.P = []; this.A = []; this.D = [];
+    this.lastT = 0;
+  }
+
+  // ---- 出力 ----
+  _w(t, p, a, d) {
+    if (t < this.lastT) t = this.lastT;
+    this.T.push(t); this.K.push(0); this.P.push(p); this.A.push(a); this.D.push(d & 0xff);
+    this.lastT = t;
+  }
+  _end(t) {
+    if (t < this.lastT) t = this.lastT;
+    this.T.push(t); this.K.push(1); this.P.push(0); this.A.push(0); this.D.push(0);
+    this.lastT = t;
+  }
+  // FM チャンネル (0-5) 単位のレジスタ。base は 0xA0 や 0xB0 など
+  _fmCh(t, ch, base, d) { this._w(t, ch >= 3 ? 1 : 0, base + (ch % 3), d); }
+  // FM オペレータ (pos: レジスタ上の並び S1,S3,S2,S4 = 0..3)
+  _fmOp(t, ch, base, pos, d) { this._w(t, ch >= 3 ? 1 : 0, base + pos * 4 + (ch % 3), d); }
+  _keyCode(ch) { return ch < 3 ? ch : ch + 1; }
+
+  // 周波数 (Hz) → [block, fnum]
+  _fnum(f) {
+    if (!(f > 0)) return [0, 0];
+    const f0 = f * 144 * 1048576 / this.clock;          // block=1 のときの fnum
+    let blk = Math.floor(Math.log2(f0)) - 9;
+    blk = blk < 0 ? 0 : blk > 7 ? 7 : blk;
+    let fn = Math.round(f0 / Math.pow(2, blk - 1));
+    if (fn > 2047) fn = 2047;
+    if (fn < 0) fn = 0;
+    return [blk, fn];
+  }
+  _setFreq(t, ch, f) {
+    const [b, n] = this._fnum(f);
+    this._fmCh(t, ch, 0xa4, (b << 3) | (n >> 8));       // 上位を先に書く
+    this._fmCh(t, ch, 0xa0, n & 255);
+  }
+
+  // SSG: 周波数 (Hz) → トーン周期
+  _ssgTone(t, i, f) {
+    let tp = f > 0 ? Math.round(this.ssgClk / (16 * f)) : 0;
+    tp = tp < 1 ? 1 : tp > 4095 ? 4095 : tp;
+    this._w(t, 0, i * 2, tp & 255);
+    this._w(t, 0, i * 2 + 1, tp >> 8);
+  }
+  _ssgVol(t, i, v) { this._w(t, 0, 8 + i, v < 0 ? 0 : v > 15 ? 15 : v); }
+
+  // ADPCM-B (PCM 系のチップを ADPCM 欄に出す。RAM は無音のまま)
+  _pcmStart(t, rate) {
+    let dn = Math.round(rate * 65536 / this.fmRate);
+    dn = dn < 1 ? 1 : dn > 65535 ? 65535 : dn;
+    this.pcmDn = dn;
+    this._w(t, 1, 0x00, 0x01);                           // リセット
+    this._w(t, 1, 0x01, 0xc0);                           // L/R 出力
+    this._w(t, 1, 0x02, 0x00); this._w(t, 1, 0x03, 0x00);
+    this._w(t, 1, 0x04, 0xff); this._w(t, 1, 0x05, 0x0f);
+    this._w(t, 1, 0x09, dn & 255); this._w(t, 1, 0x0a, dn >> 8);
+    this._w(t, 1, 0x0b, 0xc0);
+    this._w(t, 1, 0x00, 0xa0);                           // 開始 + リピート
+    this.pcmOn = true;
+  }
+  _pcmRate(t, rate) {
+    let dn = Math.round(rate * 65536 / this.fmRate);
+    dn = dn < 1 ? 1 : dn > 65535 ? 65535 : dn;
+    this.pcmDn = dn;
+    this._w(t, 1, 0x09, dn & 255); this._w(t, 1, 0x0a, dn >> 8);
+  }
+  _pcmStop(t) { this._w(t, 1, 0x00, 0x01); this.pcmOn = false; }
+
+  // ---- 実行 ----
+  _run() {
+    const h = this.h;
+    this.pcmOn = false; this.pcmDn = 0;
+    this.dac = { last: -1e9, rate: 11025, wrote: 11025 };
+    this.DAC_TIMEOUT = 1500;                             // これだけ DAC への書き込みが途切れたら停止扱い
+
+    // 初期化: OPNA モード / パン / LFO / SSG ミキサー
+    this._w(0, 0, 0x29, 0x80);
+    for (let ch = 0; ch < 6; ch++) {
+      this._fmCh(0, ch, 0xb0, 0x07);
+      this._fmCh(0, ch, 0xb4, 0xc0);
+    }
+    this._w(0, 0, 0x22, 0x0c);                           // LFO ON (約 6.9Hz)
+    this._w(0, 0, 0x07, 0x3f);
+
+    if (this.useSN) this._snInit();
+    if (this.useOPM) this._opmInit();
+    if (this.useHuC) this._hucInit();
+    if (this.useMSM) {
+      this.msm = { clock: h.msm6258Clock || 8000000, div: (h.msm6258Flags || 0) & 3, bytes: [0, 0, 0, 0], on: false };
+    }
+
+    for (const e of this.parser.events) {
+      const t = e.sampleOffset;
+      if (this.dac.last > -1e8 && this.pcmOn && this.useOPN2 && t - this.dac.last > this.DAC_TIMEOUT) {
+        this._pcmStop(this.dac.last + this.DAC_TIMEOUT);
+        this.dac.last = -1e9;
+      }
+      switch (e.type) {
+        case 'end': this._end(t); break;
+        case 'ym2612': if (this.useOPN2) this._opn2(t, e.port || 0, e.addr, e.data); break;
+        case 'ym2151': if (this.useOPM) this._opm(t, e.addr, e.data); break;
+        case 'sn76489': if (this.useSN) this._sn(t, e.data); break;
+        case 'huc6280': if (this.useHuC) this._huc(t, e.addr, e.data); break;
+        case 'msm6258': if (this.useMSM) this._msm(t, e.addr, e.data); break;
+        default: break;
+      }
+    }
+    return {
+      clock: this.clock,
+      T: Float64Array.from(this.T), K: Uint8Array.from(this.K),
+      P: Uint8Array.from(this.P), A: Uint8Array.from(this.A), D: Uint8Array.from(this.D),
+    };
+  }
+
+  // ================= YM2612 (そのまま) =================
+  _opn2(t, p, a, d) {
+    if (a === 0x2a) {                                    // DAC データ → ADPCM 欄の発音表示へ
+      if (p === 0) this._dac(t);
+      return;
+    }
+    if (a === 0x2b) return;
+    if (p === 0 && (a === 0x22 || a === 0x27 || a === 0x28)) { this._w(t, 0, a, d); return; }
+    if (a >= 0x30 && a <= 0xb6) this._w(t, p, a, d);
+  }
+
+  _dac(t) {
+    const s = this.dac;
+    if (!this.pcmOn) {
+      this._pcmStart(t, s.rate);
+      s.wrote = s.rate;
+    } else if (t > s.last) {
+      const r = 44100 / (t - s.last);                    // 書き込み間隔から再生レートを推定
+      s.rate = s.rate * 0.9 + r * 0.1;
+      if (Math.abs(s.rate / s.wrote - 1) > 0.25) { this._pcmRate(t, s.rate); s.wrote = s.rate; }
+    }
+    s.last = t;
+  }
+
+  // ================= SN76489 → SSG =================
+  _snInit() {
+    const h = this.h;
+    this.sn = {
+      clock: h.sn76489Clock || 3579545,
+      lch: 0, lvol: 0, tone: [0, 0, 0], noise: 0, att: [15, 15, 15, 15],
+    };
+    this._w(0, 0, 0x07, 0x38);                           // トーン A-C ON / ノイズ OFF
+    for (let i = 0; i < 3; i++) this._ssgVol(0, i, 0);
+  }
+
+  _snAtt(a) { return a >= 15 ? 0 : Math.max(1, 15 - Math.round(a * 2 / 3)); }
+
+  _sn(t, d) {
+    const s = this.sn;
+    if (d & 0x80) {
+      s.lch = (d >> 5) & 3; s.lvol = (d >> 4) & 1;
+      const v = d & 15;
+      if (s.lvol) s.att[s.lch] = v;
+      else if (s.lch === 3) s.noise = v & 7;
+      else s.tone[s.lch] = (s.tone[s.lch] & 0x3f0) | v;
+    } else {
+      const v = d & 0x3f;
+      if (s.lvol) s.att[s.lch] = v & 15;
+      else if (s.lch === 3) s.noise = v & 7;
+      else s.tone[s.lch] = (s.tone[s.lch] & 0x0f) | (v << 4);
+    }
+    this._snSync(t, s.lch);
+  }
+
+  _snSync(t, ch) {
+    const s = this.sn;
+    const noiseOn = s.att[3] < 15;
+    if (ch < 3) {
+      const n = s.tone[ch] || 1024;
+      this._ssgTone(t, ch, s.clock / (32 * n));
+      if (!(ch === 2 && noiseOn)) this._ssgVol(t, ch, this._snAtt(s.att[ch]));   // C はノイズ中ノイズ側の音量
+      if (ch === 2 && (s.noise & 3) === 3) this._snNoise(t);
+      return;
+    }
+    this._snNoise(t);
+  }
+
+  _snNoise(t) {
+    const s = this.sn;
+    const on = s.att[3] < 15;
+    this._w(t, 0, 0x07, on ? 0x1c : 0x38);               // ノイズ中は SSG C のトーンを止めてノイズにする
+    if (on) {
+      const r = s.noise & 3;
+      const fn = r < 3 ? s.clock / (512 << r) : s.clock / (32 * (s.tone[2] || 1024));
+      let np = Math.round(this.ssgClk / (16 * fn));
+      np = np < 1 ? 1 : np > 31 ? 31 : np;
+      this._w(t, 0, 0x06, np);
+      this._ssgVol(t, 2, this._snAtt(s.att[3]));
+    } else {
+      this._ssgVol(t, 2, this._snAtt(s.att[2]));
+    }
+  }
+
+  // ================= YM2151 → FM1-6 (+ SSG A/B) =================
+  _opmInit() {
+    this.opmClock = this.h.ym2151Clock || 3579545;
+    this.opm = Array.from({ length: 8 }, () => ({
+      kc: 0, kf: 0, kon: false, alg: 0, fb: 0, rl: 0xc0, pms: 0, ams: 0, tl: [127, 127, 127, 127],
+    }));
+    this.opmSsg = !this.useSN;                           // SN76489 と併用でなければ CH7/8 を SSG へ
+    if (this.opmSsg) this._w(0, 0, 0x07, 0x3c);          // SSG A/B のトーンだけ ON
+  }
+
+  _opmFreq(c) {
+    const n = c.kc & 15;
+    const semi = (((c.kc >> 4) & 7) - 4) * 12 + (n - (n >> 2) - 8) + (c.kf >> 2) / 64;
+    return 440 * (this.opmClock / 3579545) * Math.pow(2, semi / 12);
+  }
+
+  _opmPanReg(c) {
+    return ((c.rl & 0x40) ? 0x80 : 0) | ((c.rl & 0x80) ? 0x40 : 0) | (c.ams << 4) | c.pms;
+  }
+
+  // CH7/8 (OPNA にない FM) の簡易表示: SSG A/B に音程と音量だけ出す
+  _opmSsgSync(t, ch) {
+    if (!this.opmSsg) return;
+    const c = this.opm[ch], i = ch - 6;
+    const car = c.alg <= 3 ? [3] : c.alg === 4 ? [2, 3] : c.alg <= 6 ? [1, 2, 3] : [0, 1, 2, 3];
+    let tl = 127;
+    for (const p of car) if (c.tl[p] < tl) tl = c.tl[p];
+    this._ssgTone(t, i, this._opmFreq(c));
+    this._ssgVol(t, i, c.kon ? 15 - (tl >> 2) : 0);
+  }
+
+  _opm(t, a, d) {
+    if (a < 0x20) {
+      if (a === 0x08) {                                  // キーオン: bit3=M1 bit4=M2 bit5=C1 bit6=C2
+        const ch = d & 7, c = this.opm[ch];
+        c.kon = (d & 0x78) !== 0;
+        if (ch < 6) {
+          const mask = ((d & 0x08) ? 0x10 : 0) | ((d & 0x20) ? 0x20 : 0) | ((d & 0x10) ? 0x40 : 0) | ((d & 0x40) ? 0x80 : 0);
+          this._w(t, 0, 0x28, mask | this._keyCode(ch));
+        } else this._opmSsgSync(t, ch);
+      }
+      return;
+    }
+    const ch = a & 7, c = this.opm[ch];
+    if (a < 0x40) {
+      switch (a & 0xf8) {
+        case 0x20:                                       // RL / FB / CON
+          c.rl = d & 0xc0; c.fb = (d >> 3) & 7; c.alg = d & 7;
+          if (ch < 6) { this._fmCh(t, ch, 0xb0, (c.fb << 3) | c.alg); this._fmCh(t, ch, 0xb4, this._opmPanReg(c)); }
+          else this._opmSsgSync(t, ch);
+          break;
+        case 0x28: case 0x30:                            // KC / KF
+          if ((a & 0xf8) === 0x28) c.kc = d & 0x7f; else c.kf = d & 0xfc;
+          if (ch < 6) this._setFreq(t, ch, this._opmFreq(c));
+          else this._opmSsgSync(t, ch);
+          break;
+        case 0x38:                                       // PMS / AMS
+          c.pms = (d >> 4) & 7; c.ams = d & 3;
+          if (ch < 6) this._fmCh(t, ch, 0xb4, this._opmPanReg(c));
+          break;
+      }
+      return;
+    }
+    const pos = (a >> 3) & 3;
+    switch (a & 0xe0) {
+      case 0x40: if (ch < 6) this._fmOp(t, ch, 0x30, pos, d & 0x7f); break;          // DT1 / MUL
+      case 0x60:                                                                      // TL
+        c.tl[pos] = d & 0x7f;
+        if (ch < 6) this._fmOp(t, ch, 0x40, pos, d & 0x7f); else this._opmSsgSync(t, ch);
+        break;
+      case 0x80: if (ch < 6) this._fmOp(t, ch, 0x50, pos, d & 0xdf); break;          // KS / AR
+      case 0xa0: if (ch < 6) this._fmOp(t, ch, 0x60, pos, d & 0x9f); break;          // AMS-EN / D1R
+      case 0xc0: if (ch < 6) this._fmOp(t, ch, 0x70, pos, d & 0x1f); break;          // DT2 / D2R (DT2 は無視)
+      case 0xe0: if (ch < 6) this._fmOp(t, ch, 0x80, pos, d); break;                 // D1L / RR
+    }
+  }
+
+  // ================= HuC6280 → FM1-6 (1 オペレータ) =================
+  _hucInit() {
+    this.hucClock = this.h.huc6280Clock || 3579545;
+    this.huc = { sel: 0, main: 0, ch: Array.from({ length: 6 }, () => ({ freq: 0, ctl: 0, bal: 0 })) };
+    for (let ch = 0; ch < 6; ch++) {
+      for (let pos = 0; pos < 4; pos++) {                // 全オペレータをキャリアにして op4 だけ鳴らす
+        this._fmOp(0, ch, 0x30, pos, 0x01);
+        this._fmOp(0, ch, 0x40, pos, 0x7f);
+        this._fmOp(0, ch, 0x50, pos, 0x1f);
+        this._fmOp(0, ch, 0x60, pos, 0x00);
+        this._fmOp(0, ch, 0x70, pos, 0x00);
+        this._fmOp(0, ch, 0x80, pos, 0x0f);
+      }
+    }
+  }
+
+  _huc(t, a, d) {
+    const s = this.huc;
+    if (a === 0) { s.sel = d & 7; return; }
+    if (a === 1) { s.main = d; for (let i = 0; i < 6; i++) this._hucSync(t, i); return; }
+    if (s.sel > 5) return;
+    const c = s.ch[s.sel];
+    if (a === 2) c.freq = (c.freq & 0xf00) | d;
+    else if (a === 3) c.freq = (c.freq & 0x0ff) | ((d & 15) << 8);
+    else if (a === 4) c.ctl = d;
+    else if (a === 5) c.bal = d;
+    else return;
+    this._hucSync(t, s.sel);
+  }
+
+  _hucSync(t, i) {
+    const s = this.huc, c = s.ch[i];
+    const v5 = c.ctl & 31;
+    const mL = s.main >> 4, mR = s.main & 15, bL = c.bal >> 4, bR = c.bal & 15;
+    const audible = (c.ctl & 0x80) !== 0 && v5 > 0 && ((mL && bL) || (mR && bR));
+    let tl = 2 * (31 - v5) + 4 * (15 - Math.max(bL, bR)) + 4 * (15 - Math.max(mL, mR));
+    tl = !v5 ? 127 : tl > 127 ? 127 : tl;
+    if (!(c.ctl & 0x40)) this._setFreq(t, i, this.hucClock / (32 * (c.freq || 4096)));   // DDA 中は周波数が無意味
+    this._fmOp(t, i, 0x40, 3, tl);
+    this._w(t, 0, 0x28, (audible ? 0xf0 : 0x00) | this._keyCode(i));
+  }
+
+  // ================= MSM6258 → ADPCM 欄 =================
+  _msmRate() { return this.msm.clock / [1024, 768, 512, 512][this.msm.div]; }
+
+  _msm(t, a, d) {
+    const m = this.msm;
+    switch (a & 0x7f) {
+      case 0x00:
+        if (d & 1) { if (m.on) this._pcmStop(t); m.on = false; }
+        else if ((d & 2) && !m.on) { m.on = true; this._pcmStart(t, this._msmRate()); }
+        break;
+      case 0x08:
+        m.div = d & 3;
+        if (m.on) this._pcmRate(t, this._msmRate());
+        break;
+      case 0x09: case 0x0a: case 0x0b: case 0x0c:
+        m.bytes[(a & 0x7f) - 9] = d;
+        if ((a & 0x7f) === 0x0c) {
+          const c = (m.bytes[0] | (m.bytes[1] << 8) | (m.bytes[2] << 16) | (m.bytes[3] << 24)) >>> 0;
+          if (c) { m.clock = c; if (m.on) this._pcmRate(t, this._msmRate()); }
+        }
+        break;
+    }
+  }
+}
+
 class FmdspVisualizer {
   constructor(canvas) {
     this.canvas = canvas;
@@ -3018,6 +3407,7 @@ class FmdspVisualizer {
     this.running = false;
     this.active = true;
     this.style = 0; this.palette = 0;
+    this.fmRate = 55467;                  // 表示側 OPNA の FM サンプリングレート (attach で更新)
     this.lastFrame = 0; this.fpsCount = 0; this.fpsT = 0; this.fps = 0; this.cpuAcc = 0;
     canvas.addEventListener('click', (e) => this.cycle(e.shiftKey));
     this._loop = this._loop.bind(this);
@@ -3053,9 +3443,13 @@ class FmdspVisualizer {
     await this.ready;
     this.active = true;
     const w = this.w, h = parser.header;
-    const use2608 = !!h.ym2608Clock || (!h.ym2203Clock && parser.events.some(e => e.type === 'ym2608'));
+    const hasOPN = !!(h.ym2203Clock || h.ym2608Clock || parser.events.some(e => e.type === 'ym2203' || e.type === 'ym2608'));
+    // OPN 系以外 (YM2612 / YM2151 / SN76489 / HuC6280 / MSM6258) は仮想 OPNA のレジスタ書き込みへ変換して表示する
+    const tr = (!hasOPN && OpnaTranslator.canTranslate(parser)) ? OpnaTranslator.convert(parser) : null;
+    const use2608 = tr ? true : (!!h.ym2608Clock || (!h.ym2203Clock && parser.events.some(e => e.type === 'ym2608')));
     const chipType = use2608 ? 'ym2608' : 'ym2203';
-    const clock = use2608 ? (h.ym2608Clock || 7987200) : (h.ym2203Clock || 3993600);
+    const clock = tr ? tr.clock : (use2608 ? (h.ym2608Clock || 7987200) : (h.ym2203Clock || 3993600));
+    this.fmRate = use2608 ? clock / 144 : clock / 72;
 
     // リズム音源 ROM は既存の YM2608_RHYTHM_ROM をそのまま使う
     if (typeof YM2608_RHYTHM_ROM !== 'undefined') {
@@ -3063,25 +3457,31 @@ class FmdspVisualizer {
       w.vis_drum_rom_commit();
     }
     w.vis_init(use2608 ? 1 : 0, clock);
-    if (parser.adpcmRam) {
+    if (!tr && parser.adpcmRam) {
       const n = Math.min(parser.adpcmRam.length, 1 << 18);
       new Uint8Array(w.memory.buffer, w.vis_adpcm_ram_ptr(), n).set(parser.adpcmRam.subarray(0, n));
     }
-    this.style = use2608 ? 0 : 2;
+    this.style = (tr || use2608) ? 0 : 2;
     w.vis_set_style(this.style);
     const g = parser.gd3;
     this._setText((g && g.trackNameEn) || filename.replace(/\.[^.]+$/, ''));
 
     // 対象チップのイベントだけを型付き配列へ ('end' は kind=1)
-    const src = parser.events.filter(e => e.type === chipType || e.type === 'end');
-    const n = src.length;
-    this.t = new Float64Array(n); this.k = new Uint8Array(n);
-    this.p = new Uint8Array(n); this.a = new Uint8Array(n); this.d = new Uint8Array(n);
-    src.forEach((e, i) => {
-      this.t[i] = e.sampleOffset;
-      if (e.type === 'end') this.k[i] = 1;
-      else { this.p[i] = e.port || 0; this.a[i] = e.addr; this.d[i] = e.data; }
-    });
+    let n;
+    if (tr) {                                   // 変換済みのイベント列をそのまま使う
+      n = tr.T.length;
+      this.t = tr.T; this.k = tr.K; this.p = tr.P; this.a = tr.A; this.d = tr.D;
+    } else {
+      const src = parser.events.filter(e => e.type === chipType || e.type === 'end');
+      n = src.length;
+      this.t = new Float64Array(n); this.k = new Uint8Array(n);
+      this.p = new Uint8Array(n); this.a = new Uint8Array(n); this.d = new Uint8Array(n);
+      src.forEach((e, i) => {
+        this.t[i] = e.sampleOffset;
+        if (e.type === 'end') this.k[i] = 1;
+        else { this.p[i] = e.port || 0; this.a[i] = e.addr; this.d[i] = e.data; }
+      });
+    }
     this.n = n; this.idx = 0;
     this.loopOff = parser.loopSampleOffset;
     this.loopIdx = 0;
@@ -3104,7 +3504,7 @@ class FmdspVisualizer {
   }
 
   _advance(delta) {
-    const w = this.w, R = 55467 / 44100, MIXWIN = 0.15 * 44100;
+    const w = this.w, R = this.fmRate / 44100, MIXWIN = 0.15 * 44100;
     this.elapsed += delta;
     if (this.vpos < 0) {
       const take = Math.min(-this.vpos, delta);
@@ -3155,7 +3555,7 @@ class FmdspVisualizer {
       if (this.player.playing && !this.player.ended && !this.finished) { this._advance(dt * 44100); }
       playing = (this.player.playing && !this.finished) ? 1 : 0;
       const tick = 735;
-      w.vis_set_time(this.elapsed * 55467 / 44100, Math.floor(this.elapsed / tick),
+      w.vis_set_time(this.elapsed * this.fmRate / 44100, Math.floor(this.elapsed / tick),
         Math.floor(Math.max(0, this.vpos) / tick), Math.floor(this.total / tick), this.loops, playing);
     } else {
       w.vis_set_time(0, 0, 0, 0, 0, 0);
