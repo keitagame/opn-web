@@ -1,0 +1,288 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OPL4 VGM Player</title>
+<style>
+  :root {
+    --bg: #f4f5f8; --panel: #ffffff; --text: #1d2030; --sub: #6a6f85;
+    --line: #dde0ea; --accent: #3b6cf6; --accent-text: #ffffff; --warn: #b45309; --err: #c62828;
+    --row-active: #e7eeff;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #14161d; --panel: #1d2029; --text: #e8eaf2; --sub: #9399b0;
+      --line: #2e3242; --accent: #6b93ff; --accent-text: #0e1220; --warn: #f5a524; --err: #ff6b6b;
+      --row-active: #263154;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+    font: 15px/1.5 system-ui, -apple-system, "Hiragino Sans", "Yu Gothic UI", Meiryo, sans-serif; }
+  main { max-width: 720px; margin: 0 auto; padding: 24px 16px 48px; }
+  h1 { font-size: 20px; margin: 0 0 16px; }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 16px; margin-bottom: 14px; }
+  #drop { border: 2px dashed var(--line); text-align: center; padding: 26px 12px; cursor: pointer; color: var(--sub); }
+  #drop.over { border-color: var(--accent); color: var(--accent); }
+  #drop b { color: var(--text); }
+  button { font: inherit; color: var(--text); background: var(--panel); border: 1px solid var(--line);
+    border-radius: 8px; padding: 8px 14px; cursor: pointer; }
+  button:hover { border-color: var(--accent); }
+  button.primary { background: var(--accent); color: var(--accent-text); border-color: var(--accent); font-weight: 600; min-width: 84px; }
+  button:disabled { opacity: .45; cursor: default; }
+  .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+  .grow { flex: 1; }
+  #title { font-size: 18px; font-weight: 600; word-break: break-all; }
+  #meta { color: var(--sub); font-size: 13px; margin-top: 2px; word-break: break-all; }
+  input[type=range] { width: 100%; accent-color: var(--accent); }
+  .time { font-variant-numeric: tabular-nums; color: var(--sub); font-size: 13px; display: flex; justify-content: space-between; }
+  label.chk { display: inline-flex; gap: 6px; align-items: center; color: var(--sub); cursor: pointer; }
+  #status { font-size: 13px; min-height: 1.4em; }
+  #status.warn { color: var(--warn); } #status.err { color: var(--err); }
+  ul { list-style: none; margin: 0; padding: 0; }
+  li { padding: 8px 10px; border-radius: 8px; cursor: pointer; display: flex; gap: 8px; word-break: break-all; }
+  li:hover { background: var(--bg); }
+  li.active { background: var(--row-active); font-weight: 600; }
+  li .n { color: var(--sub); min-width: 1.8em; text-align: right; font-weight: 400; }
+  .small { font-size: 12.5px; color: var(--sub); }
+  details summary { cursor: pointer; color: var(--sub); }
+  #loader { display: none; }
+</style>
+</head>
+<body>
+<main>
+  <h1>OPL4 (YMF278B) VGM Player</h1>
+
+  <!-- libopl4.js が自動で読めなかった時だけ表示 -->
+  <div class="panel" id="loader">
+    <div class="small" style="margin-bottom:8px">
+      <code>libopl4.js</code> を自動読み込みできませんでした（file:// で開いた場合など）。ファイルを直接選択してください。
+    </div>
+    <input type="file" id="libFile" accept=".js">
+  </div>
+
+  <div class="panel" id="drop">
+    <b>VGM / VGZ ファイルをここにドロップ</b><br>またはクリックして選択（複数可）
+    <input type="file" id="files" accept=".vgm,.vgz" multiple hidden>
+  </div>
+
+  <div class="panel">
+    <div id="title">(未選択)</div>
+    <div id="meta">&nbsp;</div>
+    <div style="margin:14px 0 4px"><input type="range" id="seek" min="0" max="1000" value="0" disabled></div>
+    <div class="time"><span id="cur">0:00</span><span id="tot">0:00</span></div>
+    <div class="row" style="margin-top:12px">
+      <button id="prev" disabled>⏮</button>
+      <button id="play" class="primary" disabled>▶ 再生</button>
+      <button id="stop" disabled>⏹</button>
+      <button id="next" disabled>⏭</button>
+      <label class="chk"><input type="checkbox" id="loop" checked>ループ</label>
+      <span class="grow"></span>
+      <label class="chk">音量 <input type="range" id="vol" min="0" max="100" value="80" style="width:110px"></label>
+    </div>
+    <div id="status" style="margin-top:10px"></div>
+  </div>
+
+  <div class="panel" id="listPanel" style="display:none"><ul id="list"></ul></div>
+
+  <div class="panel">
+    <details>
+      <summary>ウェーブROM (yrw801.rom 等) の設定</summary>
+      <p class="small">OPL4のPCM音源にはROMが必要です（VGM内に埋め込まれていない場合）。一度読み込むとこのブラウザに保存されます。</p>
+      <div class="row">
+        <input type="file" id="romFile">
+        <button id="romClear">保存済みROMを削除</button>
+      </div>
+      <div class="small" id="romState" style="margin-top:6px">ROM: 未設定</div>
+    </details>
+  </div>
+</main>
+
+<script type="module">
+const $ = id => document.getElementById(id);
+let Lib = null;
+let ctx = null, player = null, gain = null;
+let romData = null;
+const tracks = [];       // {name, buffer}
+let cur = -1;
+let seeking = false;
+let loadToken = 0;
+
+// ---------------- libopl4.js 読み込み ----------------
+async function loadLib() {
+  try {
+    Lib = await import('./libopl4.js');
+  } catch (e) {
+    console.warn('auto import failed:', e);
+    $('loader').style.display = 'block';
+  }
+}
+$('libFile').addEventListener('change', async e => {
+  const f = e.target.files[0]; if (!f) return;
+  const url = URL.createObjectURL(new Blob([await f.arrayBuffer()], { type: 'text/javascript' }));
+  try { Lib = await import(url); $('loader').style.display = 'none'; setStatus('libopl4.js を読み込みました'); }
+  catch (err) { setStatus('libopl4.js の読み込みに失敗: ' + err.message, 'err'); }
+  finally { URL.revokeObjectURL(url); }
+});
+await loadLib();
+
+// ---------------- ROM 保存 (IndexedDB) ----------------
+const idb = {
+  open() { return new Promise((res, rej) => { const r = indexedDB.open('opl4player', 1);
+    r.onupgradeneeded = () => r.result.createObjectStore('kv');
+    r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); }); },
+  async get(k) { const d = await this.open(); return new Promise((res, rej) => { const r = d.transaction('kv').objectStore('kv').get(k); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); }); },
+  async set(k, v) { const d = await this.open(); return new Promise((res, rej) => { const t = d.transaction('kv', 'readwrite'); t.objectStore('kv').put(v, k); t.oncomplete = res; t.onerror = () => rej(t.error); }); },
+  async del(k) { const d = await this.open(); return new Promise((res, rej) => { const t = d.transaction('kv', 'readwrite'); t.objectStore('kv').delete(k); t.oncomplete = res; t.onerror = () => rej(t.error); }); },
+};
+function romLabel() { $('romState').textContent = romData ? `ROM: 設定済み (${(romData.byteLength / 1024) | 0} KB)` : 'ROM: 未設定'; }
+try { const r = await idb.get('rom'); if (r) romData = r; } catch (e) { /* ignore */ }
+romLabel();
+$('romFile').addEventListener('change', async e => {
+  const f = e.target.files[0]; if (!f) return;
+  romData = await f.arrayBuffer(); romLabel();
+  try { await idb.set('rom', romData); } catch (err) { /* ignore */ }
+  if (player) { player.loadRom(romData); if (cur >= 0) selectTrack(cur, player.playing); }
+});
+$('romClear').addEventListener('click', async () => {
+  romData = null; romLabel(); try { await idb.del('rom'); } catch (e) { /* ignore */ }
+});
+
+// ---------------- UI ヘルパ ----------------
+function setStatus(msg, cls = '') { const s = $('status'); s.textContent = msg; s.className = cls; }
+function fmt(sec) { sec = Math.max(0, sec | 0); return `${(sec / 60) | 0}:${String(sec % 60).padStart(2, '0')}`; }
+
+function renderList() {
+  $('listPanel').style.display = tracks.length ? '' : 'none';
+  $('list').innerHTML = '';
+  tracks.forEach((t, i) => {
+    const li = document.createElement('li');
+    if (i === cur) li.className = 'active';
+    const n = document.createElement('span'); n.className = 'n'; n.textContent = i + 1;
+    const s = document.createElement('span'); s.textContent = t.name;
+    li.append(n, s);
+    li.onclick = () => selectTrack(i, true);
+    $('list').append(li);
+  });
+  const has = tracks.length > 0;
+  $('prev').disabled = $('next').disabled = tracks.length < 2;
+  $('play').disabled = $('stop').disabled = !has;
+}
+
+function ensureAudio() {
+  if (ctx) { if (ctx.state === 'suspended') ctx.resume(); return; }
+  ctx = new (window.AudioContext || window.webkitAudioContext)();
+  gain = ctx.createGain();
+  gain.gain.value = $('vol').value / 100;
+  gain.connect(ctx.destination);
+  player = new Lib.VGMPlayer(ctx);
+  player.connect(gain);
+  if (romData) player.loadRom(romData);
+  player.setLoop($('loop').checked);
+  player.onPosition = ({ sample, total }) => {
+    if (!seeking) {
+      $('seek').value = total ? Math.min(1000, (sample / total) * 1000) : 0;
+      $('cur').textContent = fmt(sample / 44100);
+    }
+  };
+  player.onEnded = () => {
+    $('play').textContent = '▶ 再生';
+    if (tracks.length > 1) setTimeout(() => selectTrack((cur + 1) % tracks.length, true), 300);
+  };
+}
+
+// ---------------- ファイル追加 ----------------
+async function addFiles(fileList) {
+  if (!Lib) { setStatus('libopl4.js が未読み込みです', 'err'); return; }
+  const before = tracks.length;
+  for (const f of fileList) {
+    if (!/\.(vgm|vgz)$/i.test(f.name)) continue;
+    tracks.push({ name: f.name, buffer: await f.arrayBuffer() });
+  }
+  if (tracks.length === before) { setStatus('.vgm / .vgz ファイルが見つかりません', 'warn'); return; }
+  renderList();
+  selectTrack(before, true);
+}
+
+async function selectTrack(i, autoplay) {
+  const token = ++loadToken;
+  cur = i; renderList();
+  ensureAudio();
+  player.pause();
+  setStatus('読み込み中…');
+  try {
+    const raw = await Lib.decompressVgz(tracks[i].buffer.slice(0));
+    if (token !== loadToken) return;
+    const parser = new Lib.VGMParser(raw);
+    player.load(parser);
+    if (romData) player.loadRom(romData);
+
+    const g = parser.gd3 || {};
+    const h = parser.header;
+    $('title').textContent = g.trackNameJp || g.trackNameEn || tracks[i].name;
+    const chips = [h.ymf278bClock || (!h.ymf262Clock && player.cfg.ymf278bClock) ? 'YMF278B (OPL4)' : null,
+                   player.cfg.ymf262Clock ? 'YMF262 (OPL3)' : null].filter(Boolean).join(' + ') || '対応チップなし';
+    const info = [g.gameNameJp || g.gameNameEn, g.authorJp || g.authorEn, chips].filter(Boolean).join(' / ');
+    $('meta').textContent = info;
+    $('tot').textContent = fmt(parser.totalSamples / 44100);
+    $('cur').textContent = '0:00'; $('seek').value = 0; $('seek').disabled = false;
+
+    const needRom = player.cfg.ymf278bClock && !romData && !parser.opl4Mem;
+    if (!player.cfg.ymf262Clock && !player.cfg.ymf278bClock) setStatus('このVGMにはOPL3/OPL4のデータがありません', 'err');
+    else if (needRom) setStatus('注意: PCM音源用のウェーブROMが未設定です（FM音のみ鳴る可能性があります）', 'warn');
+    else setStatus('');
+
+    if (autoplay) { player.play(); $('play').textContent = '⏸ 一時停止'; }
+    else $('play').textContent = '▶ 再生';
+  } catch (e) {
+    console.error(e);
+    setStatus('読み込みエラー: ' + e.message, 'err');
+  }
+}
+
+// ---------------- コントロール ----------------
+$('play').addEventListener('click', () => {
+  if (!player || cur < 0) return;
+  ensureAudio();
+  if (player.ended) { player.stop(); player.ended = false; }
+  if (player.playing) { player.pause(); $('play').textContent = '▶ 再生'; }
+  else { player.play(); $('play').textContent = '⏸ 一時停止'; }
+});
+$('stop').addEventListener('click', () => {
+  if (!player) return;
+  player.stop(); player.ended = false;
+  $('play').textContent = '▶ 再生'; $('seek').value = 0; $('cur').textContent = '0:00';
+});
+$('prev').addEventListener('click', () => selectTrack((cur - 1 + tracks.length) % tracks.length, true));
+$('next').addEventListener('click', () => selectTrack((cur + 1) % tracks.length, true));
+$('loop').addEventListener('change', e => player && player.setLoop(e.target.checked));
+$('vol').addEventListener('input', e => { if (gain) gain.gain.value = e.target.value / 100; });
+
+$('seek').addEventListener('input', e => {
+  seeking = true;
+  if (player) $('cur').textContent = fmt((e.target.value / 1000) * player.totalSamples / 44100);
+});
+$('seek').addEventListener('change', e => {
+  if (player && cur >= 0) {
+    const was = player.playing;
+    player.pause();
+    player.ended = false;
+    player.seekSample(Math.floor((e.target.value / 1000) * player.totalSamples));
+    if (was) player.play();
+  }
+  seeking = false;
+});
+
+// ---------------- ドロップ / 選択 ----------------
+const drop = $('drop');
+drop.addEventListener('click', () => $('files').click());
+$('files').addEventListener('change', e => { addFiles([...e.target.files]); e.target.value = ''; });
+['dragenter', 'dragover'].forEach(ev => drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.add('over'); }));
+['dragleave', 'drop'].forEach(ev => drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.remove('over'); }));
+drop.addEventListener('drop', e => addFiles([...e.dataTransfer.files]));
+window.addEventListener('dragover', e => e.preventDefault());
+window.addEventListener('drop', e => { e.preventDefault(); if (!drop.contains(e.target)) addFiles([...e.dataTransfer.files]); });
+</script>
+</body>
+</html>
