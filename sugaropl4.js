@@ -1610,6 +1610,45 @@ class VGMPlayer {
 
   setLoop(enabled) { this.loopEnabled = enabled; }
 
+  /**
+   * 分割シーク: render() 1回あたり eventsPerBlock 件ずつイベントを流し込む。
+   * その間は無音を出力し、音声スレッドを長時間ブロックしない (AudioWorklet 向け)。
+   */
+  seekSampleAsync(targetSample, eventsPerBlock = 1000) {
+    this._createChips();
+    this.fx.reset();
+    this._seek = { target: targetSample, i: 0, per: eventsPerBlock };
+    this.currentSample = targetSample;
+  }
+
+  _stepSeek() {
+    const sk = this._seek, ev = this.events;
+    let n = 0;
+    while (sk.i < ev.length && ev[sk.i].sampleOffset <= sk.target && n < sk.per) {
+      this._dispatch(ev[sk.i]); sk.i++; n++;
+    }
+    if (sk.i >= ev.length || ev[sk.i].sampleOffset > sk.target) {
+      this.eventIndex = sk.i;
+      this._seek = null;
+      if (this.onSeeked) this.onSeeked();
+    }
+  }
+
+  /** 全チップを実際の再生経路で空回しして JIT を温める (最初の音切れ対策)。状態は破棄される */
+  warmUp(blocks = 400) {
+    if (!this.events.length) return;
+    const l = new Float32Array(128), r = new Float32Array(128);
+    const loop = this.loopEnabled, cb = [this.onEnded, this.onLooped, this.onPosition];
+    this.onEnded = this.onLooped = this.onPosition = null;
+    this.loopEnabled = false;
+    this.playing = true;
+    for (let i = 0; i < blocks && this.playing && !this.ended; i++) this.render(l, r);
+    this.loopEnabled = loop;
+    [this.onEnded, this.onLooped, this.onPosition] = cb;
+    this.stop();            // チップ・FX を初期化 (再生位置も 0 に戻る)
+    this.ended = false;
+  }
+
   _renderChips() {
     let l = 0, r = 0;
     if (this.chip262) { const s = this.chip262.renderSample(); l += s[0]; r += s[1]; }
@@ -1651,6 +1690,12 @@ class VGMPlayer {
   /** left/right (Float32Array) にレンダリング。ScriptProcessor / AudioWorklet 共通 */
   render(left, right) {
     const n = left.length, fx = this.fx;
+
+    if (this._seek) {                       // 分割シーク中: 無音で少しずつ進める
+      this._stepSeek();
+      left.fill(0); right.fill(0);
+      return;
+    }
 
     // 停止中でも残響が消えるまで処理し、消えたら完全に無音で返す
     if ((!this.playing || this.ended) && (!fx.enabled || this._idle >= this._tailSamples)) {
@@ -1698,6 +1743,7 @@ if (IN_WORKLET) {
       const p = this.player;
       p.onEnded = () => this.port.postMessage({ type: 'ended' });
       p.onLooped = () => this.port.postMessage({ type: 'looped' });
+      p.onSeeked = () => this.port.postMessage({ type: 'seeked' });
       p.onPosition = (pos) => this.port.postMessage({ type: 'position', ...pos });
       this.port.onmessage = (e) => this._onMessage(e.data);
     }
@@ -1709,12 +1755,13 @@ if (IN_WORKLET) {
         case 'load':
           p.load({ events: m.events, totalSamples: m.totalSamples,
                    loopSampleOffset: m.loopSampleOffset, header: m.header, opl4Mem: m.opl4Mem });
+          if (m.warmUp !== false) p.warmUp(m.warmUpBlocks || 400);   // 再生前に JIT を温める
           this.port.postMessage({ type: 'loaded' });
           break;
         case 'play': p.play(); break;
         case 'pause': p.pause(); break;
         case 'stop': p.stop(); break;
-        case 'seek': p.seekSample(m.sample); break;
+        case 'seek': p.seekSampleAsync(m.sample); break;
         case 'loop': p.setLoop(m.enabled); break;
         case 'fxPreset': p.setFxPreset(m.name, m.overrides); break;
         case 'fx': p.setFx(m.params); break;
@@ -1747,8 +1794,62 @@ class VGMWorkletPlayer {
    */
   static async create(audioCtx, vgmSampleRate = 44100, options = {}) {
     const url = options.moduleUrl || import.meta.url;
+    VGMWorkletPlayer.prepareIOS(audioCtx);
     await audioCtx.audioWorklet.addModule(url);
     return new VGMWorkletPlayer(audioCtx, vgmSampleRate, options);
+  }
+
+  /**
+   * iOS Safari 対策 (create() が自動で呼ぶ。AudioContext 生成直後に単独で呼んでもよい)
+   *  - 消音スイッチ(サイレントモード)でも鳴るよう audioSession を 'playback' に
+   *  - 最初のタッチ/クリックで resume() + 無音再生して AudioContext を解錠
+   */
+  static prepareIOS(audioCtx) {
+    try { if (navigator.audioSession) navigator.audioSession.type = 'playback'; } catch (e) { /* ignore */ }
+    if (audioCtx.__oplUnlockArmed || typeof document === 'undefined') return;
+    audioCtx.__oplUnlockArmed = true;
+
+    let silentEl = null;
+    const unlock = () => {
+      // ジェスチャー内で同期的に呼ぶこと (await 不可)
+      try { audioCtx.resume(); } catch (e) { /* ignore */ }
+      try {                                    // 無音バッファ再生 (古い iOS の解錠)
+        const b = audioCtx.createBuffer(1, 1, audioCtx.sampleRate);
+        const src = audioCtx.createBufferSource();
+        src.buffer = b; src.connect(audioCtx.destination); src.start(0);
+      } catch (e) { /* ignore */ }
+      // audioSession 非対応の iOS: <audio> を鳴らすと消音スイッチを越えられる
+      if (!navigator.audioSession && !silentEl) {
+        try {
+          silentEl = document.createElement('audio');
+          silentEl.setAttribute('playsinline', '');
+          silentEl.loop = true;
+          silentEl.src = 'data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQAAAAA=';
+          silentEl.play().catch(() => {});
+        } catch (e) { /* ignore */ }
+      }
+      if (audioCtx.state === 'running') {
+        for (const ev of ['touchstart', 'touchend', 'mousedown', 'click', 'keydown'])
+          document.removeEventListener(ev, unlock, true);
+        audioCtx.__oplUnlockArmed = false;
+      }
+    };
+    for (const ev of ['touchstart', 'touchend', 'mousedown', 'click', 'keydown'])
+      document.addEventListener(ev, unlock, true);
+  }
+
+  /** AudioContext を確実に running にする。iOS の 'interrupted' / resume が返らない場合も再試行 */
+  async resume() {
+    const ctx = this.audioCtx;
+    for (let t = 0; t < 3 && ctx.state !== 'running'; t++) {
+      try {
+        await Promise.race([ctx.resume(), new Promise(r => setTimeout(r, 800))]);
+      } catch (e) { /* ignore */ }
+      if (ctx.state !== 'running') {
+        try { await ctx.suspend(); } catch (e) { /* ignore */ }   // interrupted 状態の仕切り直し
+      }
+    }
+    return ctx.state === 'running';
   }
 
   constructor(audioCtx, vgmSampleRate = 44100, options = {}) {
@@ -1763,6 +1864,7 @@ class VGMWorkletPlayer {
     this.onEnded = null;
     this.onLooped = null;
     this.onLoaded = null;
+    this.onSeeked = null;
 
     this.node = new AudioWorkletNode(audioCtx, 'opl4-processor', {
       numberOfInputs: 0,
@@ -1775,6 +1877,16 @@ class VGMWorkletPlayer {
         fx: options.fx
       }
     });
+    // 電話着信・バックグラウンド復帰・ロック解除などで止まったら、再生中なら自動復帰
+    const tryResume = () => { if (this.playing && audioCtx.state !== 'running') this.resume(); };
+    audioCtx.addEventListener('statechange', tryResume);
+    if (typeof document !== 'undefined') {
+      document.addEventListener('visibilitychange', () => { if (!document.hidden) tryResume(); });
+      window.addEventListener('pageshow', tryResume);
+      for (const ev of ['touchend', 'click'])
+        document.addEventListener(ev, tryResume, true);   // 復帰できない時は次のタップで再開
+    }
+
     this.node.port.onmessage = (e) => {
       const m = e.data;
       if (m.type === 'position') {
@@ -1787,6 +1899,8 @@ class VGMWorkletPlayer {
         if (this.onLooped) this.onLooped();
       } else if (m.type === 'loaded') {
         if (this.onLoaded) this.onLoaded();
+      } else if (m.type === 'seeked') {
+        if (this.onSeeked) this.onSeeked();
       }
     };
   }
@@ -1803,13 +1917,14 @@ class VGMWorkletPlayer {
   }
 
   /** VGMParser の結果を Worklet へ送る */
-  load(parser) {
+  load(parser, { warmUp = true } = {}) {
     this.totalSamples = parser.totalSamples;
     this.currentSample = 0;
     this.ended = false;
     this.playing = false;
     this._post({
       type: 'load',
+      warmUp,
       events: parser.events,
       totalSamples: parser.totalSamples,
       loopSampleOffset: parser.loopSampleOffset,
@@ -1818,7 +1933,13 @@ class VGMWorkletPlayer {
     });
   }
 
-  play() { this.playing = true; this._post({ type: 'play' }); }
+  /** ユーザー操作 (click/touch) のハンドラから直接呼ぶこと。戻り値は再生開始の可否 */
+  play() {
+    this.playing = true;
+    const p = this.audioCtx.state !== 'running' ? this.resume() : Promise.resolve(true);  // resume() は同期的に開始される
+    this._post({ type: 'play' });
+    return p;
+  }
   pause() { this.playing = false; this._post({ type: 'pause' }); }
   stop() { this.playing = false; this.currentSample = 0; this._post({ type: 'stop' }); }
   seekSample(sample) { this.currentSample = sample; this._post({ type: 'seek', sample }); }
