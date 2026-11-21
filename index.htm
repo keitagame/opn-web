@@ -112,7 +112,7 @@ let loadToken = 0;
 // ---------------- libopl4.js 読み込み ----------------
 async function loadLib() {
   try {
-    Lib = await import('./sugeropl4.js');
+    Lib = await import('./sugaropl4.js');
   } catch (e) {
     console.warn('auto import failed:', e);
     $('loader').style.display = 'block';
