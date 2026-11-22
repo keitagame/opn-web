@@ -1514,9 +1514,14 @@ class WasmChipEngine {
     this._paramsPtr = this.x.paramsPtr();
     this._outL = this.x.outLPtr();
     this._outR = this.x.outRPtr();
+    this._fxParamsPtr = this.x.fxParamsPtr();
+    this._fOutL = this.x.fOutLPtr();
+    this._fOutR = this.x.fOutRPtr();
     this.blockMax = this.x.blockMax();
     this._bufRef = null;
     this._refresh();
+    // インスタンスを作り直した場合は FX も復元 (状態は初期化される)
+    if (this._fxSr) { this.x.fxInit(this._fxSr); this._pushFxParams(this._fxVals); }
   }
 
   /** memory.grow でバッファが入れ替わるので、変わったらビューを作り直す */
@@ -1528,7 +1533,42 @@ class WasmChipEngine {
     this.outL = new Float64Array(buf, this._outL, this.blockMax);
     this.outR = new Float64Array(buf, this._outR, this.blockMax);
     this.memory = new Uint8Array(buf, this._memPtr, MEM_SIZE);
+    this.fxParams = new Float64Array(buf, this._fxParamsPtr, 32);
+    this.fOutL = new Float32Array(buf, this._fOutL, this.blockMax);   // FX 後の最終出力 (softOut 済み)
+    this.fOutR = new Float32Array(buf, this._fOutR, this.blockMax);
   }
+
+  // ---- SpatialFX (状態と処理は wasm、パラメータ導出は JS の SpatialFX.set) ----
+  /** sr 用に FX を生成し、fx(SpatialFX) の現在のパラメータを反映 */
+  fxInit(sr, fx) {
+    this._fxSr = sr;
+    this.x.fxInit(sr);
+    this._refresh();
+    this.fxSet(fx);
+  }
+  fxSet(fx) {
+    const p = fx.p, v = this._fxVals || (this._fxVals = new Float64Array(32));
+    v[0] = fx.enabled ? 1 : 0;
+    v[1] = p.decorrelate > 0 ? p.decorrelate : 0;
+    v[2] = p.width == null ? 1 : p.width;
+    v[3] = p.crossfeed > 0 ? p.crossfeed : 0;
+    v[4] = p.early > 0 ? p.early : 0;
+    v[5] = p.reverb > 0 ? p.reverb : 0;
+    v[6] = p.limiter !== false ? 1 : 0;
+    v[7] = fx.pdLen; v[8] = fx.dDamp;
+    for (let i = 0; i < 8; i++) { v[9 + i] = fx.dLen[i]; v[17 + i] = fx.dG[i]; }
+    this._pushFxParams(v);
+  }
+  _pushFxParams(v) {
+    this._refresh();
+    this.fxParams.set(v);
+    this.x.fxApply();
+  }
+  fxReset() { this.x.fxReset(); }
+  /** チップ出力(outL/outR)に FX+softOut をかけて fOutL/fOutR へ */
+  fxRun(count) { this.x.fxRun(count); this._refresh(); }
+  /** 無音入力で FX のみ (残響の減衰) */
+  fxSilence(count) { this.x.fxSilence(count); this._refresh(); }
 
   _setParams(q) {
     const p = this.params;
@@ -1619,6 +1659,7 @@ class VGMPlayer {
 
     this.fmQ = options.fmQuality || 'smooth';
     this.fx = new SpatialFX(this.outRate, options.fxPreset || 'immersive', options.fx || null);
+    if (this.wasm) this.wasm.fxInit(this.outRate, this.fx);
     this._idle = 0;
     this._tailSamples = Math.ceil(this.outRate * 6);   // 停止後にリバーブ残響を鳴らし切る長さ
 
@@ -1631,9 +1672,9 @@ class VGMPlayer {
   }
 
   /** 空間エフェクトのプリセット切替: 'off' | 'natural' | 'immersive' | 'hall' | 'headphone' */
-  setFxPreset(name, overrides) { this.fx.setPreset(name, overrides); this._idle = 0; }
+  setFxPreset(name, overrides) { this.fx.setPreset(name, overrides); this._idle = 0; if (this.wasm) this.wasm.fxSet(this.fx); }
   /** 空間エフェクトのパラメータをライブ変更 (例: { reverb: 0.3, width: 1.5 }) */
-  setFx(params) { this.fx.set(params); }
+  setFx(params) { this.fx.set(params); if (this.wasm) this.wasm.fxSet(this.fx); }
 
   /** FM 音質の切替: 'smooth' | 'ultra' | 'authentic' | { preset, oversample, deharsh, shelfDb, ... } (再生中も可) */
   setFmQuality(q) {
@@ -1643,7 +1684,12 @@ class VGMPlayer {
   }
 
   /** WasmChipEngine を後から差し替える (null で JS 実装に戻す)。load() より前に呼ぶこと */
-  setWasm(engine) { this.wasm = engine || null; this.chip262 = this.chip278 = null; }
+  setWasm(engine) {
+    this.wasm = engine || null; this.chip262 = this.chip278 = null;
+    if (this.wasm) this.wasm.fxInit(this.outRate, this.fx);
+  }
+
+  _fxReset() { this.fx.reset(); if (this.wasm) this.wasm.fxReset(); }
 
   connect(destination) { if (this.node) this.node.connect(destination); }
   disconnect() { try { this.node.disconnect(); } catch (e) { /* ignore */ } }
@@ -1702,7 +1748,7 @@ class VGMPlayer {
     this.currentSample = 0;
     this.eventIndex = 0;
     this._createChips();
-    this.fx.reset();
+    this._fxReset();
   }
 
   _dispatch(ev) {
@@ -1720,7 +1766,7 @@ class VGMPlayer {
 
   seekSample(targetSample) {
     this._createChips();
-    this.fx.reset();
+    this._fxReset();
     let i = 0;
     while (i < this.events.length && this.events[i].sampleOffset <= targetSample) {
       this._dispatch(this.events[i]);
@@ -1738,7 +1784,7 @@ class VGMPlayer {
    */
   seekSampleAsync(targetSample, eventsPerBlock = 1000) {
     this._createChips();
-    this.fx.reset();
+    this._fxReset();
     this._seek = { target: targetSample, i: 0, per: eventsPerBlock };
     this.currentSample = targetSample;
   }
@@ -1811,9 +1857,9 @@ class VGMPlayer {
     return sample;
   }
 
-  /** wasm 経路: 次のイベントまでの区間をまとめて wasm で生成 → FX 処理 */
+  /** wasm 経路: 次のイベントまでの区間をまとめて wasm で生成 → FX → softOut (すべて wasm) */
   _renderWasm(left, right) {
-    const n = left.length, fx = this.fx, w = this.wasm, ev = this.events;
+    const n = left.length, w = this.wasm, ev = this.events;
     let i = 0;
     while (i < n) {
       if (this.playing && !this.ended && this._dispatchDue()) {
@@ -1823,22 +1869,18 @@ class VGMPlayer {
         while (run < maxRun && (run === 0 || cs < next)) { cs += this.vgmPerOut; run++; }
         this.currentSample = cs;
         w.render(run);
-        const oL = w.outL, oR = w.outR;
-        for (let j = 0; j < run; j++) {
-          let l = oL[j], r = oR[j];
-          if (fx.enabled) { fx.process(l, r); l = fx.outL; r = fx.outR; }
-          left[i + j] = softOut(l);
-          right[i + j] = softOut(r);
-        }
+        w.fxRun(run);
+        left.set(w.fOutL.subarray(0, run), i);
+        right.set(w.fOutR.subarray(0, run), i);
         this._idle = 0;
         i += run;
       } else {                       // 停止/終了: FX の残響だけ処理
-        let l = 0, r = 0;
-        if (fx.enabled) { fx.process(0, 0); l = fx.outL; r = fx.outR; }
-        left[i] = softOut(l);
-        right[i] = softOut(r);
-        this._idle++;
-        i++;
+        const cnt = Math.min(n - i, w.blockMax);
+        w.fxSilence(cnt);
+        left.set(w.fOutL.subarray(0, cnt), i);
+        right.set(w.fOutR.subarray(0, cnt), i);
+        this._idle += cnt;
+        i += cnt;
       }
     }
   }
