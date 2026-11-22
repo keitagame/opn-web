@@ -1481,6 +1481,108 @@ class SpatialFX {
 }
 
 // =====================================================================
+//  WebAssembly チップエンジン (OPL3 / OPL4 エミュレーション部分のみ)
+//   sugaropl4.wasm = assembly/index.ts (AssemblyScript) を -O3 --runtime stub でビルドしたもの。
+//   出力は JS 実装と同一 (差は浮動小数の丸め誤差 ~1e-15)。FX・VGM パースは JS のまま。
+// =====================================================================
+class WasmChipEngine {
+  /**
+   * @param {string|URL|ArrayBuffer|Uint8Array|WebAssembly.Module} source  .wasm の URL / バイト列 / コンパイル済み Module
+   */
+  static async create(source) {
+    if (typeof WebAssembly === 'undefined') throw new Error('WebAssembly is not available');
+    let mod;
+    if (source instanceof WebAssembly.Module) mod = source;
+    else if (typeof source === 'string' || (typeof URL !== 'undefined' && source instanceof URL)) {
+      const res = await fetch(source);
+      if (!res.ok) throw new Error('wasm fetch failed: ' + res.status);
+      mod = await WebAssembly.compile(await res.arrayBuffer());
+    } else mod = await WebAssembly.compile(source);
+    return new WasmChipEngine(mod);
+  }
+
+  constructor(module) {
+    this.module = module;
+    this._instantiate();
+  }
+
+  _instantiate() {
+    const imports = { env: { abort() { throw new Error('wasm abort'); }, seed() { return 0; } } };
+    this.x = new WebAssembly.Instance(this.module, imports).exports;
+    this.mem = this.x.memory;
+    this._memPtr = this.x.memPtr();
+    this._paramsPtr = this.x.paramsPtr();
+    this._outL = this.x.outLPtr();
+    this._outR = this.x.outRPtr();
+    this.blockMax = this.x.blockMax();
+    this._bufRef = null;
+    this._refresh();
+  }
+
+  /** memory.grow でバッファが入れ替わるので、変わったらビューを作り直す */
+  _refresh() {
+    const buf = this.mem.buffer;
+    if (buf === this._bufRef) return;
+    this._bufRef = buf;
+    this.params = new Float64Array(buf, this._paramsPtr, 16);
+    this.outL = new Float64Array(buf, this._outL, this.blockMax);
+    this.outR = new Float64Array(buf, this._outR, this.blockMax);
+    this.memory = new Uint8Array(buf, this._memPtr, MEM_SIZE);
+  }
+
+  _setParams(q) {
+    const p = this.params;
+    p[0] = q.oversample; p[1] = q.egSmooth; p[2] = q.waveSoft; p[3] = q.fbScale;
+    p[4] = q.lfoSmooth ? 1 : 0; p[5] = q.softKeyOn ? 1 : 0;
+    p[6] = q.deharsh; p[7] = q.deharshThr; p[8] = q.deharshHz;
+    p[9] = q.shelfDb; p[10] = q.shelfHz; p[11] = q.rhythmLpHz;
+  }
+
+  /** チップを(再)生成。ROM/RAM は 0 クリアされるので呼び出し側で再投入すること */
+  createChips(outRate, clock262, clock278, fmQuality) {
+    // stub ランタイムは解放しないので、肥大したらインスタンスごと作り直す (~0.6ms)
+    if (this.mem.buffer.byteLength > 24 * 1048576) this._instantiate();
+    this._refresh();
+    this._setParams(resolveFmQuality(fmQuality));
+    this.x.createChips(outRate, clock262 || 0, clock278 || 0);
+    this._refresh();
+  }
+
+  setQuality(fmQuality) {
+    this._refresh();
+    this._setParams(resolveFmQuality(fmQuality));
+    this.x.setQuality();
+  }
+
+  write262(port, addr, data) { this.x.write262(port, addr, data); }
+  write278(port, addr, data) { this.x.write278(port, addr, data); }
+
+  /** ウェーブROM (0x000000〜) */
+  loadRom(data, start = 0) {
+    this._refresh();
+    const d = data instanceof Uint8Array ? data : new Uint8Array(data);
+    if (start >= RAM_BASE) return;
+    this.memory.set(d.subarray(0, Math.min(d.length, RAM_BASE - start)), start);
+  }
+  /** 4MB メモリ全体 (ROM+RAM) */
+  loadMemory(mem) {
+    this._refresh();
+    this.memory.set(mem.subarray(0, MEM_SIZE));
+  }
+
+  /** count サンプルを outL/outR (Float64Array) に生成 (count <= blockMax)。戻り値後は _refresh 済み */
+  render(count) {
+    this.x.render(count);
+    this._refresh();
+  }
+}
+
+/** WebAssembly エンジンを読み込む。失敗時は例外 (呼び出し側で JS 実装にフォールバックできる) */
+async function loadChipWasm(source) {
+  return WasmChipEngine.create(source);
+}
+
+// =====================================================================
 //  VGM Player (Web Audio API ScriptProcessorNode)
 // =====================================================================
 class VGMPlayer {
@@ -1495,6 +1597,7 @@ class VGMPlayer {
     this.vgmRate = vgmSampleRate;
     this.chip262 = null;
     this.chip278 = null;
+    this.wasm = options.wasm || null;     // WasmChipEngine (任意)。無ければ JS 実装
     this.cfg = null;
     this.extRom = null;
     this.events = [];
@@ -1535,8 +1638,12 @@ class VGMPlayer {
   /** FM 音質の切替: 'smooth' | 'ultra' | 'authentic' | { preset, oversample, deharsh, shelfDb, ... } (再生中も可) */
   setFmQuality(q) {
     this.fmQ = q;
+    if (this.wasm) { this.wasm.setQuality(q); return; }
     for (const chip of [this.chip262, this.chip278]) if (chip) chip.fm.setQuality(q);
   }
+
+  /** WasmChipEngine を後から差し替える (null で JS 実装に戻す)。load() より前に呼ぶこと */
+  setWasm(engine) { this.wasm = engine || null; this.chip262 = this.chip278 = null; }
 
   connect(destination) { if (this.node) this.node.connect(destination); }
   disconnect() { try { this.node.disconnect(); } catch (e) { /* ignore */ } }
@@ -1544,12 +1651,22 @@ class VGMPlayer {
   /** 外部ウェーブROM (yrw801.rom 等) を指定。次回の load/stop/seek から有効 */
   loadRom(arrayBuffer) {
     this.extRom = arrayBuffer instanceof Uint8Array ? arrayBuffer : new Uint8Array(arrayBuffer);
+    if (this.wasm) { if (this.cfg && this.cfg.ymf278bClock) this.wasm.loadRom(this.extRom); return; }
     if (this.chip278) this.chip278.loadRom(this.extRom);
   }
 
   _createChips() {
     const c = this.cfg;
     if (!c) return;
+    if (this.wasm) {
+      this.chip262 = this.chip278 = null;
+      this.wasm.createChips(this.outRate, c.ymf262Clock || 0, c.ymf278bClock || 0, this.fmQ);
+      if (c.ymf278bClock) {
+        if (this.extRom) this.wasm.loadRom(this.extRom);
+        if (c.opl4Mem) this.wasm.loadMemory(c.opl4Mem);
+      }
+      return;
+    }
     this.chip262 = c.ymf262Clock ? new YMF262(this.outRate, c.ymf262Clock, this.fmQ) : null;
     this.chip278 = c.ymf278bClock ? new OPL4Chip(this.outRate, c.ymf278bClock, this.fmQ) : null;
     if (this.chip278) {
@@ -1589,6 +1706,11 @@ class VGMPlayer {
   }
 
   _dispatch(ev) {
+    if (this.wasm) {
+      if (ev.type === 'ymf278b') this.wasm.write278(ev.port, ev.addr, ev.data);
+      else if (ev.type === 'ymf262') this.wasm.write262(ev.port, ev.addr, ev.data);
+      return;
+    }
     if (ev.type === 'ymf278b') {
       if (this.chip278) this.chip278.write(ev.port, ev.addr, ev.data);
     } else if (ev.type === 'ymf262') {
@@ -1658,7 +1780,8 @@ class VGMPlayer {
     return o;
   }
 
-  _renderOneOut() {
+  /** 時刻が来たイベントを処理する。曲が終わった(ループしない)場合は false */
+  _dispatchDue() {
     while (this.eventIndex < this.events.length && this.events[this.eventIndex].sampleOffset <= this.currentSample) {
       const ev = this.events[this.eventIndex];
       if (ev.type === 'end') {
@@ -1673,14 +1796,51 @@ class VGMPlayer {
         this.ended = true;
         this.playing = false;
         if (this.onEnded) this.onEnded();
-        return null;
+        return false;
       }
       this._dispatch(ev);
       this.eventIndex++;
     }
+    return true;
+  }
+
+  _renderOneOut() {
+    if (!this._dispatchDue()) return null;
     const sample = this._renderChips();
     this.currentSample += this.vgmPerOut;
     return sample;
+  }
+
+  /** wasm 経路: 次のイベントまでの区間をまとめて wasm で生成 → FX 処理 */
+  _renderWasm(left, right) {
+    const n = left.length, fx = this.fx, w = this.wasm, ev = this.events;
+    let i = 0;
+    while (i < n) {
+      if (this.playing && !this.ended && this._dispatchDue()) {
+        const next = this.eventIndex < ev.length ? ev[this.eventIndex].sampleOffset : Infinity;
+        const maxRun = Math.min(n - i, w.blockMax);
+        let run = 0, cs = this.currentSample;
+        while (run < maxRun && (run === 0 || cs < next)) { cs += this.vgmPerOut; run++; }
+        this.currentSample = cs;
+        w.render(run);
+        const oL = w.outL, oR = w.outR;
+        for (let j = 0; j < run; j++) {
+          let l = oL[j], r = oR[j];
+          if (fx.enabled) { fx.process(l, r); l = fx.outL; r = fx.outR; }
+          left[i + j] = softOut(l);
+          right[i + j] = softOut(r);
+        }
+        this._idle = 0;
+        i += run;
+      } else {                       // 停止/終了: FX の残響だけ処理
+        let l = 0, r = 0;
+        if (fx.enabled) { fx.process(0, 0); l = fx.outL; r = fx.outR; }
+        left[i] = softOut(l);
+        right[i] = softOut(r);
+        this._idle++;
+        i++;
+      }
+    }
   }
 
   _process(e) {
@@ -1703,7 +1863,9 @@ class VGMPlayer {
       return;
     }
 
-    for (let i = 0; i < n; i++) {
+    if (this.wasm) {
+      this._renderWasm(left, right);
+    } else for (let i = 0; i < n; i++) {
       let l = 0, r = 0;
       if (this.playing && !this.ended) {
         const s = this._renderOneOut();
@@ -1741,11 +1903,26 @@ if (IN_WORKLET) {
       this.player = new VGMPlayer({ sampleRate }, o.vgmRate || 44100,
         { fmQuality: o.fmQuality, fxPreset: o.fxPreset, fx: o.fx, noNode: true });
       const p = this.player;
+      // wasm エンジンの準備が終わるまでメッセージを溜めて順序を保つ
+      this._queue = [];
+      this._ready = false;
+      const done = (engine) => {
+        if (engine) p.setWasm(engine);
+        this._ready = true;
+        this.port.postMessage({ type: 'ready', wasm: !!engine });
+        for (const m of this._queue) this._onMessage(m);
+        this._queue = null;
+      };
+      if (o.wasmBytes && typeof WebAssembly !== 'undefined') {
+        WasmChipEngine.create(o.wasmBytes).then(done, () => done(null));   // 失敗時は JS 実装
+      } else {
+        done(null);
+      }
       p.onEnded = () => this.port.postMessage({ type: 'ended' });
       p.onLooped = () => this.port.postMessage({ type: 'looped' });
       p.onSeeked = () => this.port.postMessage({ type: 'seeked' });
       p.onPosition = (pos) => this.port.postMessage({ type: 'position', ...pos });
-      this.port.onmessage = (e) => this._onMessage(e.data);
+      this.port.onmessage = (e) => { if (this._ready) this._onMessage(e.data); else this._queue.push(e.data); };
     }
 
     _onMessage(m) {
@@ -1770,6 +1947,7 @@ if (IN_WORKLET) {
     }
 
     process(inputs, outputs) {
+      if (!this._ready) return true;
       const out = outputs[0];
       const l = out[0], r = out[1] || out[0];
       this.player.render(l, r);
@@ -1795,8 +1973,29 @@ class VGMWorkletPlayer {
   static async create(audioCtx, vgmSampleRate = 44100, options = {}) {
     const url = options.moduleUrl || import.meta.url;
     VGMWorkletPlayer.prepareIOS(audioCtx);
+
+    // チップエミュレーションを WebAssembly で動かす (既定: 有効)。
+    //   options.wasm = false          → JS 実装のみ
+    //   options.wasm = URL/ArrayBuffer → 指定の .wasm を使う
+    //   未指定                        → sugaropl4.wasm を自動取得 (失敗しても JS 実装で動く)
+    let wasmBytes = null;
+    if (options.wasm !== false && typeof WebAssembly !== 'undefined') {
+      try {
+        const src = options.wasm && options.wasm !== true ? options.wasm
+          : (options.wasmUrl || new URL('./sugaropl4.wasm', import.meta.url));
+        if (typeof src === 'string' || src instanceof URL) {
+          const res = await fetch(src);
+          if (!res.ok) throw new Error('HTTP ' + res.status);
+          wasmBytes = await res.arrayBuffer();
+        } else wasmBytes = src instanceof Uint8Array ? src.slice().buffer : src;
+      } catch (e) {
+        console.warn('[sugaropl4] wasm を読み込めないため JS 実装を使います:', e && e.message);
+      }
+    }
     await audioCtx.audioWorklet.addModule(url);
-    return new VGMWorkletPlayer(audioCtx, vgmSampleRate, options);
+    const player = new VGMWorkletPlayer(audioCtx, vgmSampleRate, { ...options, wasmBytes });
+    await player.ready;
+    return player;
   }
 
   /**
@@ -1874,9 +2073,13 @@ class VGMWorkletPlayer {
         vgmRate: vgmSampleRate,
         fmQuality: options.fmQuality,
         fxPreset: options.fxPreset,
-        fx: options.fx
+        fx: options.fx,
+        wasmBytes: options.wasmBytes || null
       }
     });
+    /** true: チップは WebAssembly で動作 / false: JS 実装 (ready 後に確定) */
+    this.usingWasm = false;
+    this.ready = new Promise((res) => { this._resolveReady = res; });
     // 電話着信・バックグラウンド復帰・ロック解除などで止まったら、再生中なら自動復帰
     const tryResume = () => { if (this.playing && audioCtx.state !== 'running') this.resume(); };
     audioCtx.addEventListener('statechange', tryResume);
@@ -1901,6 +2104,9 @@ class VGMWorkletPlayer {
         if (this.onLoaded) this.onLoaded();
       } else if (m.type === 'seeked') {
         if (this.onSeeked) this.onSeeked();
+      } else if (m.type === 'ready') {
+        this.usingWasm = !!m.wasm;
+        this._resolveReady(this.usingWasm);
       }
     };
   }
@@ -1975,6 +2181,8 @@ export {
   YMF262,
   VGMPlayer,
   VGMWorkletPlayer,
+  WasmChipEngine,
+  loadChipWasm,
   SpatialFX,
   FX_PRESETS,
   FM_QUALITY_PRESETS,
