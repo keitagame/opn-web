@@ -15,7 +15,9 @@
  *   - エンベロープ平滑化 / 余韻中の位相保持 (発音・消音クリック除去), ビブラート・トレモロ連続化
  *   - 不連続波形の角丸め / フィードバック量の適正化 / リズム音源ノイズのLPF
  *   - 高域シェルフ + 2.8kHz以上だけを自動圧縮するディエッサ型ダイナミック抑制
- *   - 使い方: new VGMPlayer(ctx, 44100, { fmQuality: 'smooth' | 'ultra' | 'authentic' })
+ *   - 'crystal' (既定): 透明感重視。空気感(10kHz〜)は残し、刺さる 2.2〜10kHz の金属的な成分だけを
+ *     LR4 3バンド分割の中域ダイナミック抑制 + ピーキングカット(+微小エアシェルフ)で抑える
+ *   - 使い方: new VGMPlayer(ctx, 44100, { fmQuality: 'crystal' | 'smooth' | 'ultra' | 'authentic' })
  *             player.setFmQuality({ preset: 'ultra', deharsh: 1 })
  *
  * [高音質化・臨場感強化版]
@@ -110,16 +112,31 @@ const FM_QUALITY_PRESETS = {
                deharsh: 0.55, deharshThr: 0.045, deharshHz: 2800, shelfDb: -2.0, shelfHz: 6500, rhythmLpHz: 11000 },
   ultra:     { oversample: 8, egSmooth: 0.08, waveSoft: 0.015, fbScale: 0.82, lfoSmooth: true,  softKeyOn: true,
                deharsh: 0.85, deharshThr: 0.035, deharshHz: 2500, shelfDb: -3.5, shelfHz: 5500, rhythmLpHz: 8000 },
+  // 透明感重視: 高域(空気感)は残し、刺さる 2.5〜9kHz とフィードバック由来の金属音だけを抑える
+  crystal:   { oversample: 4, egSmooth: 0.10, waveSoft: 0.012, fbScale: 0.88, lfoSmooth: true,  softKeyOn: true,
+               deharsh: 0.90, deharshThr: 0.020, deharshHz: 2200, deharshHiHz: 10000, deharshAtkMs: 1.5, deharshRelMs: 60,
+               shelfDb: 0, shelfHz: 6500,
+               presenceDb: -2.5, presenceHz: 4800, presenceQ: 0.8, airDb: 1.5, airHz: 10000,
+               rhythmLpHz: 14000 },
+};
+// 新パラメータの既定値 (0 = 無効 → 旧プリセットは従来どおりの音)
+//   deharshHiHz  : >0 で deharsh の対象を deharshHz〜deharshHiHz の帯域に限定 (それ以上の空気感は圧縮しない)
+//   deharshAtkMs / deharshRelMs : deharsh のアタック/リリース (0 = 従来値 1ms / 50ms)
+//   presenceDb/Hz/Q : 刺さり帯域の緩やかなピーキングカット (dB は負で抑制)
+//   airDb/airHz  : 空気感のハイシェルフ (dB は正でブースト)
+const FM_QUALITY_EXTRAS = {
+  deharshHiHz: 0, deharshAtkMs: 0, deharshRelMs: 0,
+  presenceDb: 0, presenceHz: 4500, presenceQ: 0.9, airDb: 0, airHz: 10000,
 };
 
 function resolveFmQuality(q) {
-  let base = FM_QUALITY_PRESETS.smooth, over = null;
+  let base = FM_QUALITY_PRESETS.crystal, over = null;
   if (typeof q === 'string') base = FM_QUALITY_PRESETS[q] || base;
   else if (q && typeof q === 'object') {
     if (q.preset && FM_QUALITY_PRESETS[q.preset]) base = FM_QUALITY_PRESETS[q.preset];
     over = q;
   }
-  const r = Object.assign({}, base, over || {});
+  const r = Object.assign({}, FM_QUALITY_EXTRAS, base, over || {});
   delete r.preset;
   if (![1, 2, 4, 8].includes(r.oversample)) r.oversample = 4;
   return r;
@@ -216,56 +233,120 @@ class HalfbandDec {
   }
 }
 
-// ---- FM バス用トーン整形: 高域シェルフ + 高域ダイナミック抑制 (ディエッサ的) ----
+// ---- FM バス用トーン整形: EQ (シェルフ/ピーキング) + 帯域限定ダイナミック抑制 (ディエッサ的) ----
+class Biquad {                            // モノラル 1 段 (直接形 I)
+  constructor() { this.on = false; this.b0 = 1; this.b1 = 0; this.b2 = 0; this.a1 = 0; this.a2 = 0; this.x1 = this.x2 = this.y1 = this.y2 = 0; }
+  reset() { this.x1 = this.x2 = this.y1 = this.y2 = 0; }
+  _set(b0, b1, b2, a0, a1, a2) {
+    this.b0 = b0 / a0; this.b1 = b1 / a0; this.b2 = b2 / a0; this.a1 = a1 / a0; this.a2 = a2 / a0; this.on = true;
+  }
+  highShelf(fs, dB, hz) {                 // RBJ ハイシェルフ (S = 1)
+    const A = Math.pow(10, dB / 40), w0 = 2 * Math.PI * hz / fs;
+    const cs = Math.cos(w0), al = Math.sin(w0) / 2 * Math.SQRT2, sA = 2 * Math.sqrt(A) * al;
+    this._set(A * ((A + 1) + (A - 1) * cs + sA), -2 * A * ((A - 1) + (A + 1) * cs), A * ((A + 1) + (A - 1) * cs - sA),
+              (A + 1) - (A - 1) * cs + sA, 2 * ((A - 1) - (A + 1) * cs), (A + 1) - (A - 1) * cs - sA);
+  }
+  peak(fs, dB, hz, Q) {                   // RBJ ピーキング
+    const A = Math.pow(10, dB / 40), w0 = 2 * Math.PI * hz / fs, cs = Math.cos(w0), al = Math.sin(w0) / (2 * Q);
+    this._set(1 + al * A, -2 * cs, 1 - al * A, 1 + al / A, -2 * cs, 1 - al / A);
+  }
+  lowpass(fs, hz) {                       // 2次バタワース
+    const w0 = 2 * Math.PI * hz / fs, cs = Math.cos(w0), al = Math.sin(w0) / Math.SQRT2;
+    this._set((1 - cs) / 2, 1 - cs, (1 - cs) / 2, 1 + al, -2 * cs, 1 - al);
+  }
+  highpass(fs, hz) {                      // 2次バタワース
+    const w0 = 2 * Math.PI * hz / fs, cs = Math.cos(w0), al = Math.sin(w0) / Math.SQRT2;
+    this._set((1 + cs) / 2, -(1 + cs), (1 + cs) / 2, 1 + al, -2 * cs, 1 - al);
+  }
+  run(x) {
+    const y = this.b0 * x + this.b1 * this.x1 + this.b2 * this.x2 - this.a1 * this.y1 - this.a2 * this.y2;
+    this.x2 = this.x1; this.x1 = x; this.y2 = this.y1; this.y1 = y; return y;
+  }
+}
+
+/** 1 チャンネル分の 3 バンド Linkwitz-Riley (LR4) 分割。low + mid + high は全域通過 (位相整合済み) */
+class Split3 {
+  constructor() {
+    const mk = () => [new Biquad(), new Biquad()];
+    this.lo1 = mk(); this.hp1 = mk();      // f1 での LP / HP
+    this.midLp = mk(); this.hiHp = mk();   // f2 での LP / HP (hp1 の出力に適用)
+    this.cmpLp = mk(); this.cmpHp = mk();  // 低域を f2 の全域通過に通して位相を揃える
+    this.low = 0; this.mid = 0; this.high = 0;
+  }
+  reset() { for (const k of ['lo1','hp1','midLp','hiHp','cmpLp','cmpHp']) for (const b of this[k]) b.reset(); }
+  setup(fs, f1, f2) {
+    const lp = (a, f) => { a[0].lowpass(fs, f); a[1].lowpass(fs, f); };
+    const hp = (a, f) => { a[0].highpass(fs, f); a[1].highpass(fs, f); };
+    lp(this.lo1, f1); hp(this.hp1, f1); lp(this.midLp, f2); hp(this.hiHp, f2); lp(this.cmpLp, f2); hp(this.cmpHp, f2);
+  }
+  run(x) {
+    const r = (a, v) => a[1].run(a[0].run(v));
+    const lo = r(this.lo1, x), hp = r(this.hp1, x);
+    this.mid = r(this.midLp, hp); this.high = r(this.hiHp, hp);
+    this.low = r(this.cmpLp, lo) + r(this.cmpHp, lo);
+  }
+}
+
 class FmTone {
   constructor(rate) {
     this.rate = rate;
     this.oL = 0; this.oR = 0;
+    this.shelfL = new Biquad(); this.shelfR = new Biquad();
+    this.presL = new Biquad(); this.presR = new Biquad();
+    this.airL = new Biquad(); this.airR = new Biquad();
+    this.sL = new Split3(); this.sR = new Split3();
     this.reset();
   }
   reset() {
-    this.x1L = this.x2L = this.y1L = this.y2L = 0;
-    this.x1R = this.x2R = this.y1R = this.y2R = 0;
+    for (const b of [this.shelfL, this.shelfR, this.presL, this.presR, this.airL, this.airR]) b.reset();
+    this.sL.reset(); this.sR.reset();
     this.lpAL = this.lpBL = this.lpAR = this.lpBR = 0;
     this.env = 0;
   }
   setup(q) {
     const fs = this.rate;
-    this.shelfOn = q.shelfDb !== 0;
-    if (this.shelfOn) {                   // RBJ ハイシェルフ
-      const A = Math.pow(10, q.shelfDb / 40), w0 = 2 * Math.PI * q.shelfHz / fs;
-      const cs = Math.cos(w0), al = Math.sin(w0) / 2 * Math.SQRT2, sA = 2 * Math.sqrt(A) * al;
-      const a0 = (A + 1) - (A - 1) * cs + sA;
-      this.b0 = A * ((A + 1) + (A - 1) * cs + sA) / a0;
-      this.b1 = -2 * A * ((A - 1) + (A + 1) * cs) / a0;
-      this.b2 = A * ((A + 1) + (A - 1) * cs - sA) / a0;
-      this.a1 = 2 * ((A - 1) - (A + 1) * cs) / a0;
-      this.a2 = ((A + 1) - (A - 1) * cs - sA) / a0;
+    this.shelfOn = q.shelfDb !== 0; this.presOn = q.presenceDb !== 0; this.airOn = q.airDb !== 0;
+    if (this.shelfOn) { this.shelfL.highShelf(fs, q.shelfDb, q.shelfHz); this.shelfR.highShelf(fs, q.shelfDb, q.shelfHz); }
+    if (this.presOn) {
+      const Q = q.presenceQ > 0 ? q.presenceQ : 0.9;
+      this.presL.peak(fs, q.presenceDb, q.presenceHz, Q); this.presR.peak(fs, q.presenceDb, q.presenceHz, Q);
     }
+    if (this.airOn) { this.airL.highShelf(fs, q.airDb, q.airHz); this.airR.highShelf(fs, q.airDb, q.airHz); }
     this.dhOn = q.deharsh > 0;
     this.dhThr = q.deharshThr;
     this.dhExp = 1 - 1 / (1 + 5 * q.deharsh);          // 圧縮比 1 + 5*amount
     this.aLp = 1 - Math.exp(-2 * Math.PI * q.deharshHz / fs);
-    this.aAtk = 1 - Math.exp(-1 / (0.001 * fs));
-    this.aRel = 1 - Math.exp(-1 / (0.05 * fs));
+    this.dhBand = q.deharshHiHz > q.deharshHz;          // 帯域限定モード: deharshHz〜deharshHiHz だけを圧縮 (空気感は素通し)
+    if (this.dhBand) {
+      const f2 = Math.min(q.deharshHiHz, fs * 0.42);
+      this.sL.setup(fs, q.deharshHz, f2); this.sR.setup(fs, q.deharshHz, f2);
+    }
+    this.aAtk = 1 - Math.exp(-1 / ((q.deharshAtkMs > 0 ? q.deharshAtkMs : 1) * 0.001 * fs));
+    this.aRel = 1 - Math.exp(-1 / ((q.deharshRelMs > 0 ? q.deharshRelMs : 50) * 0.001 * fs));
   }
   process(inL, inR) {
     let l = inL, r = inR;
-    if (this.shelfOn) {
-      const yl = this.b0 * l + this.b1 * this.x1L + this.b2 * this.x2L - this.a1 * this.y1L - this.a2 * this.y2L;
-      this.x2L = this.x1L; this.x1L = l; this.y2L = this.y1L; this.y1L = yl; l = yl;
-      const yr = this.b0 * r + this.b1 * this.x1R + this.b2 * this.x2R - this.a1 * this.y1R - this.a2 * this.y2R;
-      this.x2R = this.x1R; this.x1R = r; this.y2R = this.y1R; this.y1R = yr; r = yr;
-    }
+    if (this.shelfOn) { l = this.shelfL.run(l); r = this.shelfR.run(r); }
+    if (this.presOn)  { l = this.presL.run(l);  r = this.presR.run(r); }
+    if (this.airOn)   { l = this.airL.run(l);   r = this.airR.run(r); }
     if (this.dhOn) {
-      const a = this.aLp;
-      this.lpAL += (l - this.lpAL) * a; this.lpBL += (this.lpAL - this.lpBL) * a;
-      this.lpAR += (r - this.lpAR) * a; this.lpBR += (this.lpAR - this.lpBR) * a;
-      const hL = l - this.lpBL, hR = r - this.lpBR;
-      const e = Math.max(Math.abs(hL), Math.abs(hR));
-      this.env += (e - this.env) * (e > this.env ? this.aAtk : this.aRel);
-      const g = this.env > this.dhThr ? Math.pow(this.dhThr / this.env, this.dhExp) : 1;
-      l = this.lpBL + hL * g; r = this.lpBR + hR * g;
+      if (this.dhBand) {
+        const sl = this.sL, sr = this.sR;
+        sl.run(l); sr.run(r);
+        const e = Math.max(Math.abs(sl.mid), Math.abs(sr.mid));
+        this.env += (e - this.env) * (e > this.env ? this.aAtk : this.aRel);
+        const g = this.env > this.dhThr ? Math.pow(this.dhThr / this.env, this.dhExp) : 1;
+        l = sl.low + g * sl.mid + sl.high; r = sr.low + g * sr.mid + sr.high;
+      } else {
+        const a = this.aLp;
+        this.lpAL += (l - this.lpAL) * a; this.lpBL += (this.lpAL - this.lpBL) * a;
+        this.lpAR += (r - this.lpAR) * a; this.lpBR += (this.lpAR - this.lpBR) * a;
+        const hL = l - this.lpBL, hR = r - this.lpBR;
+        const e = Math.max(Math.abs(hL), Math.abs(hR));
+        this.env += (e - this.env) * (e > this.env ? this.aAtk : this.aRel);
+        const g = this.env > this.dhThr ? Math.pow(this.dhThr / this.env, this.dhExp) : 1;
+        l = this.lpBL + hL * g; r = this.lpBR + hR * g;
+      }
     }
     this.oL = l; this.oR = r;
   }
@@ -299,7 +380,7 @@ class OplChan {
 
 class OPL3Core {
   /**
-   * @param {string|object} [quality]  'smooth' | 'ultra' | 'authentic' | {preset, oversample, ...}
+   * @param {string|object} [quality]  'crystal' | 'smooth' | 'ultra' | 'authentic' | {preset, oversample, ...}
    * @param {number} [rate]            ネイティブ出力レート (YMF262: 49716 / YMF278B内蔵: 44100)
    */
   constructor(quality, rate) {
@@ -1529,7 +1610,7 @@ class WasmChipEngine {
     const buf = this.mem.buffer;
     if (buf === this._bufRef) return;
     this._bufRef = buf;
-    this.params = new Float64Array(buf, this._paramsPtr, 16);
+    this.params = new Float64Array(buf, this._paramsPtr, 32);
     this.outL = new Float64Array(buf, this._outL, this.blockMax);
     this.outR = new Float64Array(buf, this._outR, this.blockMax);
     this.memory = new Uint8Array(buf, this._memPtr, MEM_SIZE);
@@ -1576,6 +1657,8 @@ class WasmChipEngine {
     p[4] = q.lfoSmooth ? 1 : 0; p[5] = q.softKeyOn ? 1 : 0;
     p[6] = q.deharsh; p[7] = q.deharshThr; p[8] = q.deharshHz;
     p[9] = q.shelfDb; p[10] = q.shelfHz; p[11] = q.rhythmLpHz;
+    p[12] = q.presenceDb; p[13] = q.presenceHz; p[14] = q.presenceQ; p[15] = q.airDb;
+    p[16] = q.airHz; p[17] = q.deharshHiHz; p[18] = q.deharshAtkMs; p[19] = q.deharshRelMs;
   }
 
   /** チップを(再)生成。ROM/RAM は 0 クリアされるので呼び出し側で再投入すること */
@@ -1657,7 +1740,7 @@ class VGMPlayer {
     this.onEnded = null;
     this.onLooped = null;
 
-    this.fmQ = options.fmQuality || 'smooth';
+    this.fmQ = options.fmQuality || 'crystal';
     this.fx = new SpatialFX(this.outRate, options.fxPreset || 'immersive', options.fx || null);
     if (this.wasm) this.wasm.fxInit(this.outRate, this.fx);
     this._idle = 0;
@@ -1676,7 +1759,7 @@ class VGMPlayer {
   /** 空間エフェクトのパラメータをライブ変更 (例: { reverb: 0.3, width: 1.5 }) */
   setFx(params) { this.fx.set(params); if (this.wasm) this.wasm.fxSet(this.fx); }
 
-  /** FM 音質の切替: 'smooth' | 'ultra' | 'authentic' | { preset, oversample, deharsh, shelfDb, ... } (再生中も可) */
+  /** FM 音質の切替: 'crystal' | 'smooth' | 'ultra' | 'authentic' | { preset, oversample, deharsh, shelfDb, ... } (再生中も可) */
   setFmQuality(q) {
     this.fmQ = q;
     if (this.wasm) { this.wasm.setQuality(q); return; }
